@@ -143,6 +143,8 @@ static int g_decode_graph_capture_disabled_notice_printed;
 static int cuda_model_direct_host_access_allowed(void);
 static int cuda_moe_temp_weights_enabled(void);
 
+static int ds4_gpu_tp_selftest(int ngpu);
+
 /* Phase 2: device-resident decode params for CUDA Graph replay.
  * When ds4_cuda_params_active != 0, kernels read token/pos/etc. from
  * ds4_cuda_dev_params instead of their immediate kernel arguments.
@@ -570,6 +572,11 @@ static ncclComm_t g_pp_nccl_comms[7];
 static int g_pp_nccl_ready;
 static cudaEvent_t g_pp_event[DS4_CUDA_MAX_DEVICES];
 static cudaEvent_t g_pp_copy_event[DS4_CUDA_MAX_DEVICES];
+/* Tensor-Parallel collective scratch (GPU-count-agnostic; indexed by device id) */
+static cudaStream_t g_tp_stream[DS4_CUDA_MAX_DEVICES];
+static cudaEvent_t  g_tp_event[DS4_CUDA_MAX_DEVICES];
+static float       *g_tp_recv[DS4_CUDA_MAX_DEVICES];
+static uint32_t     g_tp_recv_floats[DS4_CUDA_MAX_DEVICES];
 static int g_moe_scratch_inited;
 
 /* Persistent MoE scratch: pre-allocated buffer for one layer's full expert
@@ -2145,6 +2152,7 @@ static int ds4_gpu_pp_init(void) {
         fprintf(stderr, "ds4: PP=%d ready (%d layers/GPU, GPU0: L%d-%d%s)\n",
                 ngpu, n0, g_pp_layer_start[0], g_pp_layer_end[0],
                 delayed ? ", delayed resident" : "");
+        if (getenv("DS4_CUDA_TP_SELFTEST") != NULL) (void)ds4_gpu_tp_selftest(ngpu);
     }
     return ok ? 1 : 0;
 }
@@ -2274,6 +2282,136 @@ extern "C" int ds4_gpu_pp_p2p_copy_ordered_async(int dst_gpu, int src_gpu,
         return 0;
     }
     return 1;
+}
+
+/* ---- Tensor-Parallel collectives (host-staged ring all-reduce) ----
+ * P2P peer-access is broken on this Blackwell driver, so cudaMemcpyPeer is
+ * host-staged (shared PCIe/host bottleneck). A ring all-reduce moves the least
+ * total data, so it is the right algorithm here (recursive-doubling moves more
+ * and is slower on a shared link). It is issued async on per-device streams
+ * ordered by events with a single sync at the end — per-step global syncs
+ * otherwise dominate. Parameterized by an explicit device-id group so it works
+ * for any TP degree / hybrid TPxPP layout. */
+__global__ static void tp_vadd_f32_kernel(float *dst, const float *src, uint32_t n) {
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] += src[i];
+}
+
+static int tp_collective_ensure(const int *devs, int n, uint32_t n_floats) {
+    int saved = 0; (void)cudaGetDevice(&saved);
+    int ok = 1;
+    for (int i = 0; i < n; i++) {
+        int d = devs[i];
+        if (d < 0 || d >= DS4_CUDA_MAX_DEVICES) { ok = 0; break; }
+        if (cudaSetDevice(d) != cudaSuccess) { ok = 0; break; }
+        if (!g_tp_stream[d] &&
+            cudaStreamCreateWithFlags(&g_tp_stream[d], cudaStreamNonBlocking) != cudaSuccess) { ok = 0; break; }
+        if (!g_tp_event[d] &&
+            cudaEventCreateWithFlags(&g_tp_event[d], cudaEventDisableTiming) != cudaSuccess) { ok = 0; break; }
+        if (g_tp_recv_floats[d] < n_floats) {
+            if (g_tp_recv[d]) { cudaFree(g_tp_recv[d]); g_tp_recv[d] = NULL; g_tp_recv_floats[d] = 0; }
+            if (cudaMalloc(&g_tp_recv[d], (size_t)n_floats * sizeof(float)) != cudaSuccess) {
+                (void)cudaGetLastError(); ok = 0; break;
+            }
+            g_tp_recv_floats[d] = n_floats;
+        }
+    }
+    (void)cudaSetDevice(saved);
+    return ok;
+}
+
+/* All-reduce(sum) float buffers across a TP group. bufs[i] is the device
+ * pointer on devs[i]; each holds n_floats. On return every device's buffer
+ * holds the elementwise sum. Returns 1 on success. */
+extern "C" int ds4_gpu_tp_all_reduce_f32(const int *devs, int n,
+                                         float *const *bufs, uint32_t n_floats) {
+    if (!devs || !bufs || n <= 0 || n_floats == 0) return 0;
+    if (n == 1) return 1;
+    if (!tp_collective_ensure(devs, n, n_floats)) return 0;
+
+    const uint32_t chunk = (n_floats + (uint32_t)n - 1u) / (uint32_t)n;
+#define TP_COFF(c) ((uint32_t)(c) * chunk)
+#define TP_CLEN(c) ( TP_COFF(c) >= n_floats ? 0u : \
+                     (n_floats - TP_COFF(c) < chunk ? n_floats - TP_COFF(c) : chunk) )
+    int saved = 0; (void)cudaGetDevice(&saved);
+    int ok = 1;
+
+    /* reduce-scatter: after N-1 steps, ring-index i holds the full sum of chunk (i+1)%N */
+    for (int step = 0; ok && step < n - 1; step++) {
+        for (int i = 0; i < n; i++) { cudaSetDevice(devs[i]); cudaEventRecord(g_tp_event[devs[i]], g_tp_stream[devs[i]]); }
+        for (int i = 0; ok && i < n; i++) {
+            int dst = (i + 1) % n;
+            int c = ((i - step) % n + n) % n;
+            uint32_t len = TP_CLEN(c); if (!len) continue;
+            int dd = devs[dst], sd = devs[i];
+            if (cudaSetDevice(dd) != cudaSuccess) { ok = 0; break; }
+            cudaStreamWaitEvent(g_tp_stream[dd], g_tp_event[sd], 0);
+            if (cudaMemcpyPeerAsync(g_tp_recv[dd] + TP_COFF(c), dd, bufs[i] + TP_COFF(c), sd,
+                                    (size_t)len * sizeof(float), g_tp_stream[dd]) != cudaSuccess) { ok = 0; break; }
+            tp_vadd_f32_kernel<<<(len + 255u) / 256u, 256, 0, g_tp_stream[dd]>>>(
+                bufs[dst] + TP_COFF(c), g_tp_recv[dd] + TP_COFF(c), len);
+        }
+    }
+    /* all-gather: rotate the reduced chunks so every device holds all of them */
+    for (int step = 0; ok && step < n - 1; step++) {
+        for (int i = 0; i < n; i++) { cudaSetDevice(devs[i]); cudaEventRecord(g_tp_event[devs[i]], g_tp_stream[devs[i]]); }
+        for (int i = 0; ok && i < n; i++) {
+            int dst = (i + 1) % n;
+            int c = ((i + 1 - step) % n + n) % n;
+            uint32_t len = TP_CLEN(c); if (!len) continue;
+            int dd = devs[dst], sd = devs[i];
+            if (cudaSetDevice(dd) != cudaSuccess) { ok = 0; break; }
+            cudaStreamWaitEvent(g_tp_stream[dd], g_tp_event[sd], 0);
+            if (cudaMemcpyPeerAsync(bufs[dst] + TP_COFF(c), dd, bufs[i] + TP_COFF(c), sd,
+                                    (size_t)len * sizeof(float), g_tp_stream[dd]) != cudaSuccess) { ok = 0; break; }
+        }
+    }
+    for (int i = 0; i < n; i++) { cudaSetDevice(devs[i]); if (cudaStreamSynchronize(g_tp_stream[devs[i]]) != cudaSuccess) ok = 0; }
+#undef TP_COFF
+#undef TP_CLEN
+    (void)cudaSetDevice(saved);
+    return ok;
+}
+
+/* Self-test: each device d starts filled with (d+1); after all-reduce every
+ * element on every device must equal sum(1..N)=N(N+1)/2. Env-gated. */
+static int ds4_gpu_tp_selftest(int ngpu) {
+    int n = ngpu > DS4_CUDA_MAX_DEVICES ? DS4_CUDA_MAX_DEVICES : ngpu;
+    if (n < 2) return 1;
+    int devs[DS4_CUDA_MAX_DEVICES];
+    float *bufs[DS4_CUDA_MAX_DEVICES] = {0};
+    for (int i = 0; i < n; i++) devs[i] = i;
+    const uint32_t M = 28672u; /* hc_dim */
+    int saved = 0; (void)cudaGetDevice(&saved);
+    int ok = 1;
+    std::vector<float> host(M);
+    for (int i = 0; ok && i < n; i++) {
+        if (cudaSetDevice(devs[i]) != cudaSuccess) { ok = 0; break; }
+        if (cudaMalloc(&bufs[i], (size_t)M * sizeof(float)) != cudaSuccess) { (void)cudaGetLastError(); ok = 0; break; }
+        for (uint32_t k = 0; k < M; k++) host[k] = (float)(devs[i] + 1);
+        if (cudaMemcpy(bufs[i], host.data(), (size_t)M * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) { ok = 0; break; }
+    }
+    double dt = 0.0;
+    if (ok) {
+        struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
+        ok = ds4_gpu_tp_all_reduce_f32(devs, n, bufs, M);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        dt = (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+    }
+    int bad = 0; float sample = 0.0f;
+    const float expect = (float)(n * (n + 1) / 2);
+    for (int i = 0; ok && i < n; i++) {
+        cudaSetDevice(devs[i]);
+        if (cudaMemcpy(host.data(), bufs[i], (size_t)M * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) { ok = 0; break; }
+        for (uint32_t k = 0; k < M; k++) if (host[k] != expect) { if (!bad) sample = host[k]; bad++; }
+    }
+    for (int i = 0; i < n; i++) if (bufs[i]) { cudaSetDevice(devs[i]); cudaFree(bufs[i]); }
+    (void)cudaSetDevice(saved);
+    fprintf(stderr, "ds4: TP all-reduce self-test N=%d M=%u: %s (%.4f ms, expect=%.0f%s)\n",
+            n, M, (ok && !bad) ? "PASS" : "FAIL", dt, (double)expect,
+            bad ? "" : "");
+    if (bad) fprintf(stderr, "ds4: TP self-test mismatch count=%d sample=%.1f\n", bad, sample);
+    return (ok && !bad) ? 1 : 0;
 }
 
 extern "C" void ds4_gpu_model_range_reserve(void) {
@@ -3197,6 +3335,41 @@ __global__ static void matmul_q8_0_preq_warp8_kernel(
     }
     acc = warp_sum_f32(acc);
     if (lane == 0) out[row] = acc;
+}
+
+/* Row-parallel (Tensor-Parallel) variant: each rank accumulates only over the
+ * input-block sub-range [blocks_start, blocks_end). Writing partials from every
+ * rank and summing them (all-reduce) reproduces the full dot product. Splitting
+ * by whole 32-element Q8_0 blocks keeps quantization intact. add_to!=0 adds into
+ * out (so a rank's own partial can accumulate without a separate buffer). */
+__global__ static void matmul_q8_0_preq_warp8_brange_kernel(
+        float *out,
+        const unsigned char *w,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t blocks,
+        uint64_t blocks_start,
+        uint64_t blocks_end,
+        int add_to,
+        int use_dp4a) {
+    uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    uint32_t lane = threadIdx.x & 31u;
+    if (row >= out_dim) return;
+    const unsigned char *wr = w + row * blocks * 34;
+    float acc = 0.0f;
+    for (uint64_t b = blocks_start + lane; b < blocks_end; b += 32u) {
+        uint64_t i0 = b * 32;
+        uint64_t bn = in_dim - i0 < 32 ? in_dim - i0 : 32;
+        const __half *scale_h = (const __half *)(wr + b * 34);
+        const int8_t *qs = (const int8_t *)(wr + b * 34 + 2);
+        const int8_t *xqb = xq + b * 32;
+        int dot = dot_i8_block(qs, xqb, bn, use_dp4a);
+        acc += __half2float(*scale_h) * xscale[b] * (float)dot;
+    }
+    acc = warp_sum_f32(acc);
+    if (lane == 0) out[row] = add_to ? out[row] + acc : acc;
 }
 
 __global__ static void matmul_q8_0_pair_preq_warp8_kernel(
@@ -7396,6 +7569,42 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
 extern "C" int ds4_gpu_matmul_q8_0_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
     return cuda_matmul_q8_0_tensor_labeled(out, model_map, model_size, weight_offset,
                                            in_dim, out_dim, x, n_tok, "q8_0");
+}
+
+/* Row-parallel (TP) Q8_0 matmul: accumulate only over input blocks
+ * [block_start, block_end) of a full Q8_0 weight. Decode-only (n_tok==1).
+ * add_to!=0 sums into out. Summing every rank's [b0,b1) partial via all-reduce
+ * reproduces the full result. block_start/end are 32-element-block indices, so
+ * the input split stays quantization-aligned. */
+extern "C" int ds4_gpu_matmul_q8_0_brange_tensor(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+        uint64_t block_start, uint64_t block_end, int add_to,
+        const ds4_gpu_tensor *x) {
+    if (!out || !x || !model_map) return 0;
+    uint64_t blocks = (in_dim + 31) / 32;
+    if (block_end > blocks || block_start > block_end) return 0;
+    if (weight_offset > model_size || out_dim > UINT64_MAX / (blocks * 34)) return 0;
+    uint64_t weight_bytes = out_dim * blocks * 34;
+    if (weight_bytes > model_size - weight_offset) return 0;
+    if (x->bytes < in_dim * sizeof(float) || out->bytes < out_dim * sizeof(float)) return 0;
+    const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "q8_0_brange");
+    if (!wptr) return 0;
+    const uint64_t xq_bytes = blocks * 32u;
+    const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
+    const uint64_t tmp_bytes = scale_offset + blocks * sizeof(float);
+    void *tmp = cuda_tmp_alloc(tmp_bytes, "q8_0 brange prequant");
+    if (!tmp) return 0;
+    int8_t *xq = (int8_t *)tmp;
+    float *xscale = (float *)((char *)tmp + scale_offset);
+    const int use_dp4a = cuda_q8_use_dp4a();
+    dim3 qgrid((unsigned)blocks, 1u, 1);
+    quantize_q8_0_f32_kernel<<<qgrid, 32, 0, ds4_decode_stream()>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
+    if (!cuda_ok(cudaGetLastError(), "matmul_q8_0_brange quantize launch")) return 0;
+    matmul_q8_0_preq_warp8_brange_kernel<<<((unsigned)out_dim + 7u) / 8u, 256, 0, ds4_decode_stream()>>>(
+            (float *)out->ptr, reinterpret_cast<const unsigned char *>(wptr),
+            xq, xscale, in_dim, out_dim, blocks, block_start, block_end, add_to, use_dp4a);
+    return cuda_ok(cudaGetLastError(), "matmul_q8_0_brange launch");
 }
 
 extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(

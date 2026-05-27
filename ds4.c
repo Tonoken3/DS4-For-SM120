@@ -16832,6 +16832,71 @@ static int generate_raw_swa_cpu(
 }
 
 #ifndef DS4_NO_GPU
+/* Tensor-Parallel building-block validation (env DS4_CUDA_TP_MATMUL_SELFTEST):
+ * verify the row-parallel block-range Q8_0 matmul reproduces the full matmul.
+ * Uses layer 0's attn_q_b (Q8_0); computes the full result and the sum of two
+ * input-block-range partials (the TP2 row-parallel pattern, reduced here on one
+ * GPU). A tiny relative diff is expected since TP reorders the fp reduction. */
+static void ds4_tp_matmul_selftest(const ds4_model *model, const ds4_weights *weights) {
+    const ds4_tensor *w = weights->layer[0].attn_q_b;
+    if (!w || w->type != DS4_TENSOR_Q8_0 || w->ndim != 2) {
+        fprintf(stderr, "ds4: TP matmul self-test skipped (no Q8_0 attn_q_b)\n");
+        return;
+    }
+    const uint64_t in_dim = w->dim[0], out_dim = w->dim[1];
+    const uint64_t blocks = (in_dim + 31) / 32;
+    if (w->bytes != out_dim * blocks * 34) {
+        fprintf(stderr, "ds4: TP matmul self-test skipped (layout mismatch bytes=%llu exp=%llu)\n",
+                (unsigned long long)w->bytes, (unsigned long long)(out_dim * blocks * 34));
+        return;
+    }
+    ds4_gpu_pp_set_device(0);
+    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(in_dim * sizeof(float));
+    ds4_gpu_tensor *out_full = ds4_gpu_tensor_alloc(out_dim * sizeof(float));
+    ds4_gpu_tensor *out_tp = ds4_gpu_tensor_alloc(out_dim * sizeof(float));
+    float *hx = (float *)malloc(in_dim * sizeof(float));
+    float *hf = (float *)malloc(out_dim * sizeof(float));
+    float *ht = (float *)malloc(out_dim * sizeof(float));
+    int ok = x && out_full && out_tp && hx && hf && ht;
+    if (ok) {
+        for (uint64_t i = 0; i < in_dim; i++) hx[i] = sinf((float)i * 0.013f) * 0.5f;
+        ok = ds4_gpu_tensor_write(x, 0, hx, in_dim * sizeof(float)) != 0;
+    }
+    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(out_full, model->map, model->size,
+                                            w->abs_offset, in_dim, out_dim, x, 1) != 0;
+    const uint64_t bmid = blocks / 2;
+    if (ok) ok = ds4_gpu_matmul_q8_0_brange_tensor(out_tp, model->map, model->size,
+                                                   w->abs_offset, in_dim, out_dim, 0, bmid, 0, x) != 0;
+    if (ok) ok = ds4_gpu_matmul_q8_0_brange_tensor(out_tp, model->map, model->size,
+                                                   w->abs_offset, in_dim, out_dim, bmid, blocks, 1, x) != 0;
+    if (ok) ok = ds4_gpu_synchronize() != 0;
+    if (ok) ok = ds4_gpu_tensor_read(out_full, 0, hf, out_dim * sizeof(float)) != 0;
+    if (ok) ok = ds4_gpu_tensor_read(out_tp, 0, ht, out_dim * sizeof(float)) != 0;
+    double maxabs = 0.0, scale = 0.0; uint64_t argmax = 0;
+    if (ok) {
+        for (uint64_t i = 0; i < out_dim; i++) {
+            double a = fabs((double)hf[i]);
+            if (a > scale) scale = a;
+            double d = fabs((double)hf[i] - (double)ht[i]);
+            if (d > maxabs) { maxabs = d; argmax = i; }
+        }
+        if (scale < 1e-12) scale = 1e-12;
+        double rel = maxabs / scale; /* worst abs error relative to output magnitude */
+        fprintf(stderr, "ds4: TP matmul row-parallel self-test: %s in=%llu out=%llu blocks=%llu split@%llu maxabs=%.3e scale=%.3e rel=%.3e\n",
+                rel < 1e-3 ? "PASS" : "FAIL",
+                (unsigned long long)in_dim, (unsigned long long)out_dim,
+                (unsigned long long)blocks, (unsigned long long)bmid,
+                maxabs, scale, rel);
+        (void)argmax;
+    } else {
+        fprintf(stderr, "ds4: TP matmul self-test: execution failed\n");
+    }
+    free(hx); free(hf); free(ht);
+    if (x) ds4_gpu_tensor_free(x);
+    if (out_full) ds4_gpu_tensor_free(out_full);
+    if (out_tp) ds4_gpu_tensor_free(out_tp);
+}
+
 /* Metal generation entry point.  The model runs as one local whole-graph
  * pipeline: chunked/layer-major prefill followed by graph decode steps. */
 static int generate_metal_graph_raw_swa(
@@ -17019,6 +17084,8 @@ static int generate_metal_graph_raw_swa(
             if (memory_report) ds4_gpu_print_memory_report("after PP graph alloc");
         }
     }
+
+    if (getenv("DS4_CUDA_TP_MATMUL_SELFTEST") != NULL) ds4_tp_matmul_selftest(model, weights);
 
     int pos = prompt->len;
     int n_generated = 0;

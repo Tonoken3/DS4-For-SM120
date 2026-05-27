@@ -911,6 +911,23 @@ int ds4_gpu_pp_p2p_copy_ordered_async(int dst_gpu, int src_gpu,
                                       void *dst_ptr, void *src_ptr,
                                       uint64_t bytes);
 
+/* Tensor-Parallel collective: all-reduce(sum) float buffers across a GPU group.
+ * devs[0..n-1] are the device ids; bufs[i] is the device pointer on devs[i],
+ * each holding n_floats. On return every buffer holds the elementwise sum.
+ * Host-staged async ring (works for any TP degree). Returns 1 on success. */
+int ds4_gpu_tp_all_reduce_f32(const int *devs, int n,
+                              float *const *bufs, uint32_t n_floats);
+
+/* Row-parallel (TP) Q8_0 matmul: accumulate only over input 32-element blocks
+ * [block_start, block_end) of a full Q8_0 weight (decode, n_tok==1). add_to!=0
+ * sums into out. Summing each rank's partial via all-reduce gives the full
+ * result. Returns 1 on success. */
+int ds4_gpu_matmul_q8_0_brange_tensor(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+        uint64_t block_start, uint64_t block_end, int add_to,
+        const ds4_gpu_tensor *x);
+
 int ds4_gpu_pp_event_record(int gpu);
 int ds4_gpu_pp_stream_wait_event(int gpu, int event_gpu);
 void *ds4_gpu_pp_stream_get(int gpu);

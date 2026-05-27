@@ -202,6 +202,32 @@ extern "C" int ds4_gpu_decode_graph_capture_end_store(int layer) {
         return 0;
     }
     ce = cudaGraphInstantiate(&g_sub_graph_exec[layer], graph, NULL, NULL, 0);
+
+    /* Phase B: graph node inventory (profile only) */
+    if (getenv("DS4_CUDA_DECODE_GRAPH_PROFILE") != NULL || layer == 0) {
+        size_t n = 0;
+        if (cudaGraphGetNodes(graph, NULL, &n) == cudaSuccess) {
+            if (n > 0) {
+                std::vector<cudaGraphNode_t> nodes(n);
+                (void)cudaGraphGetNodes(graph, nodes.data(), &n);
+                int n_kernel = 0, n_memcpy = 0, n_other = 0;
+                for (size_t i = 0; i < n; i++) {
+                    cudaGraphNodeType t;
+                    if (cudaGraphNodeGetType(nodes[i], &t) == cudaSuccess) {
+                        if (t == cudaGraphNodeTypeKernel) n_kernel++;
+                        else if (t == cudaGraphNodeTypeMemcpy) n_memcpy++;
+                        else n_other++;
+                    }
+                }
+                if (layer == 0) {
+                    fprintf(stderr, "ds4: graph node metrics (layer 0): %zu nodes, %d kernel, %d memcpy, %d other\n",
+                            n, n_kernel, n_memcpy, n_other);
+                }
+            }
+        } else {
+            (void)cudaGetLastError();
+        }
+    }
     (void)cudaGraphDestroy(graph);
     if (ce != cudaSuccess) { (void)cudaGetLastError(); return 0; }
     g_sub_graph_exec_ready[layer] = 1;

@@ -13715,25 +13715,26 @@ static bool metal_graph_eval_token_raw_swa(
     } else {
 
 
-    if (graph_capture_mode && ds4_gpu_decode_graph_captured()) {
-        double r0 = profile ? now_sec() : 0.0;
-        ok = ok && ds4_gpu_decode_params_push(g->cuda_params_host);
-        double r1 = profile ? now_sec() : 0.0;
-        ok = ok && ds4_gpu_decode_graph_launch();
-        double r2 = profile ? now_sec() : 0.0;
-        if (profile) fprintf(stderr, "ds4: graph replay push=%.3f launch=%.3f ms\n",
-                             (r1 - r0) * 1000.0, (r2 - r1) * 1000.0);
+    if (graph_capture_mode && ds4_gpu_decode_subgraphs_ready()) {
+        /* Per-layer sub-graph replay */
+        for (uint32_t il = 0; il < DS4_N_LAYER && ok; il++)
+            ok = ok && ds4_gpu_decode_subgraph_launch((int)il);
         if (profile) t_encoded = now_sec();
     } else if (graph_capture_mode && pos > 10) {
-        /* Capture the decode graph */
-        fprintf(stderr, "ds4: graph capture path pos=%u\n", pos);
-        ok = ok && ds4_gpu_decode_graph_capture();
-        if (ok) ok = ds4_gpu_decode_params_push(g->cuda_params_host);
-        if (ok) ok = metal_graph_encode_token_raw_swa(g, model, weights,
-                                                      token, pos, logits != NULL, true);
+        /* Per-layer sub-graph capture */
+        fprintf(stderr, "ds4: sub-graph capture pos=%u\n", pos);
+        for (uint32_t il = 0; il < DS4_N_LAYER && ok; il++) {
+            const ds4_layer_weights *layer = &weights->layer[il];
+            ok = ok && ds4_gpu_decode_graph_capture();
+            ok = ok && metal_graph_encode_decode_layer(g, model, layer, (uint32_t)il,
+                     pos, g->layer_raw_cache[il], g->raw_cap,
+                     pos % g->raw_cap,
+                     ((uint32_t)pos + 1 > g->raw_window ? g->raw_window : (uint32_t)pos + 1),
+                     token, false);
+            ok = ok && ds4_gpu_decode_graph_capture_end_store((int)il);
+        }
+        if (ok) fprintf(stderr, "ds4: %u sub-graphs captured\n", DS4_N_LAYER);
         if (profile) t_encoded = now_sec();
-        if (ok) ok = ds4_gpu_decode_graph_capture_end();
-        else fprintf(stderr, "ds4: graph capture failed (ok=%d)\n", ok);
     } else {
         /* Normal encode */
         fprintf(stderr, "ds4: graph normal path pos=%u graph_mode=%d host=%p\n", pos, graph_mode, (void*)g->cuda_params_host);

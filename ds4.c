@@ -9981,7 +9981,12 @@ static bool metal_graph_encode_decode_layer(
         uint32_t                raw_row,
         uint32_t                n_raw,
         int                     token,
-        bool                    skip_router) {
+        bool                    skip_router)
+{
+    /* Phase C: 0=full, 1=pre-router, 2=post-router */
+    enum { LAYER_FULL = 0, LAYER_PRE_ROUTER = 1, LAYER_POST_ROUTER = 2 };
+    const int layer_part = 0; /* caller patched by refactoring script */
+    if (layer_part == LAYER_POST_ROUTER) goto decode_layer_post_router;
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
     const uint64_t q_rank = layer->attn_q_a->dim[1];
@@ -10621,6 +10626,7 @@ static bool metal_graph_encode_decode_layer(
     const uint64_t gate_expert_bytes = expert_mid_dim * gate_row_bytes;
     const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
     const uint64_t down_expert_bytes = routed_out_dim * down_row_bytes;
+    if (layer_part == LAYER_PRE_ROUTER) return ok;  /* Phase C: stop before router */
     if (!skip_router) {
     if (ok) ok = metal_graph_matmul_plain_tensor(g->router_logits, model, layer->ffn_gate_inp,
                                                  DS4_N_EMBD, DS4_N_EXPERT, g->ffn_norm, 1);
@@ -10646,6 +10652,7 @@ static bool metal_graph_encode_decode_layer(
         metal_graph_debug_dump_tensor("ffn_moe_weights_scaled", g->router_weights, DS4_N_EXPERT_USED, il, pos);
     }
     } /* !skip_router */
+decode_layer_post_router:
     if (ok) ok = ds4_gpu_routed_moe_one_tensor(g->routed_out,
                                                  g->routed_gate,
                                                  g->routed_up,

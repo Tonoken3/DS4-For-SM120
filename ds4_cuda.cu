@@ -300,11 +300,24 @@ static int g_model_load_progress_started;
 static int g_model_load_progress_tty;
 static void *g_cuda_tmp;
 static uint64_t g_cuda_tmp_bytes;
+static void *g_moe_staging_host;     /* pinned host buffer for MoE weight copies */
+static uint64_t g_moe_staging_bytes;
 static void *g_model_stage_raw[4];
 static void *g_model_stage[4];
 static cudaEvent_t g_model_stage_event[4];
 static uint64_t g_model_stage_bytes;
 static int g_moe_temp_weights_notice_printed;
+static int g_moe_scratch_inited;
+
+/* Persistent MoE scratch: pre-allocated buffer for one layer's full expert
+ * weights (gate+up+down, all 256 experts). Allocated once instead of
+ * cudaMalloc/free per layer, making it compatible with CUDA Graph capture. */
+static char *g_moe_scratch_gate;
+static char *g_moe_scratch_up;
+static char *g_moe_scratch_down;
+static uint64_t g_moe_scratch_gate_bytes;
+static uint64_t g_moe_scratch_up_bytes;
+static uint64_t g_moe_scratch_down_bytes;
 
 static int cuda_ok(cudaError_t err, const char *what);
 static int cuda_decode_graph_enabled(void);
@@ -498,6 +511,46 @@ static const char *cuda_model_temp_range_alloc(
     if (!model_map || bytes == 0 || offset > model_size || bytes > model_size - offset) return NULL;
     if (bytes > (uint64_t)SIZE_MAX) return NULL;
 
+    /* Use persistent scratch for MoE when available (graph-mode compatible) */
+    if (g_moe_scratch_inited) {
+        int slot = -1;
+        if (what && strstr(what, "moe_gate") && g_moe_scratch_gate && bytes <= g_moe_scratch_gate_bytes) slot = 0;
+        else if (what && strstr(what, "moe_up") && g_moe_scratch_up && bytes <= g_moe_scratch_up_bytes) slot = 1;
+        else if (what && strstr(what, "moe_down") && g_moe_scratch_down && bytes <= g_moe_scratch_down_bytes) slot = 2;
+        if (slot >= 0) {
+            char *scratch = slot == 0 ? g_moe_scratch_gate : slot == 1 ? g_moe_scratch_up : g_moe_scratch_down;
+            /* Copy from model mapping (unpinned) to pinned staging buffer via CPU,
+             * then launch async H2D from pinned to device. This ensures the async
+             * memcpy is truly non-blocking and compatible with CUDA Graph capture. */
+            const char *src = (const char *)model_map + offset;
+            if (g_moe_staging_host && bytes <= g_moe_staging_bytes) {
+                char *staging = (char *)g_moe_staging_host;
+                memcpy(staging, src, (size_t)bytes);
+                cudaError_t err = cudaMemcpyAsync(scratch, staging, (size_t)bytes,
+                                                  cudaMemcpyHostToDevice, ds4_decode_stream());
+                if (err != cudaSuccess) {
+                    fprintf(stderr, "ds4: CUDA moe staged copy failed for %s: %s\n",
+                            what ? what : "?", cudaGetErrorString(err));
+                    (void)cudaGetLastError();
+                    return NULL;
+                }
+            } else {
+                /* Fallback: direct unpinned->device (may block) */
+                cudaError_t err = cudaMemcpyAsync(scratch, src, (size_t)bytes,
+                                                  cudaMemcpyHostToDevice, ds4_decode_stream());
+                if (err != cudaSuccess) {
+                    fprintf(stderr, "ds4: CUDA moe direct copy failed for %s: %s\n",
+                            what ? what : "?", cudaGetErrorString(err));
+                    (void)cudaGetLastError();
+                    return NULL;
+                }
+            }
+            tmp->device_ptr = scratch;
+            tmp->bytes = bytes;
+            return scratch;
+        }
+    }
+
     void *dev = NULL;
     cudaError_t err = cudaMalloc(&dev, (size_t)bytes);
     if (err != cudaSuccess) {
@@ -555,11 +608,24 @@ static int cuda_moe_temp_weights_release(
         (up && up->device_ptr) ||
         (down && down->device_ptr);
     int ok = 1;
-    if (has_temp) ok = cuda_ok(cudaStreamSynchronize(ds4_decode_stream()),
-                               "routed_moe transient weights sync");
-    cuda_model_temp_range_free(gate);
-    cuda_model_temp_range_free(up);
-    cuda_model_temp_range_free(down);
+    if (has_temp) {
+        /* When using persistent scratch (g_moe_scratch_inited), the buffers
+         * are never freed/synced here — just reset the tracking struct. */
+        if (!g_moe_scratch_inited) {
+            ok = cuda_ok(cudaStreamSynchronize(ds4_decode_stream()),
+                         "routed_moe transient weights sync");
+        }
+    }
+    if (!g_moe_scratch_inited) {
+        cuda_model_temp_range_free(gate);
+        cuda_model_temp_range_free(up);
+        cuda_model_temp_range_free(down);
+    } else {
+        /* Only reset tracking pointers, don't free the persistent scratch */
+        if (gate) { gate->device_ptr = NULL; gate->bytes = 0; }
+        if (up)   { up->device_ptr   = NULL; up->bytes   = 0; }
+        if (down) { down->device_ptr = NULL; down->bytes = 0; }
+    }
     return ok;
 }
 
@@ -1554,6 +1620,43 @@ extern "C" int ds4_gpu_init(void) {
     return 1;
 }
 
+void ds4_gpu_init_moe_scratch(uint64_t gate_bytes, uint64_t up_bytes, uint64_t down_bytes) {
+    if (g_moe_scratch_inited) return;
+    /* Limit to available VRAM: skip if total > 2 GiB */
+    if (gate_bytes + up_bytes + down_bytes > 2ull * 1073741824ull) {
+        fprintf(stderr, "ds4: MoE scratch too large (%.2f GiB), skipping\n",
+                (double)(gate_bytes + up_bytes + down_bytes) / 1073741824.0);
+        return;
+    }
+    cudaError_t ce;
+    ce = cudaMalloc(&g_moe_scratch_gate, (size_t)gate_bytes);
+    if (ce != cudaSuccess) { fprintf(stderr, "ds4: MoE scratch gate alloc failed\n"); (void)cudaGetLastError(); return; }
+    ce = cudaMalloc(&g_moe_scratch_up, (size_t)up_bytes);
+    if (ce != cudaSuccess) { fprintf(stderr, "ds4: MoE scratch up alloc failed\n"); (void)cudaFree(g_moe_scratch_gate); g_moe_scratch_gate = NULL; (void)cudaGetLastError(); return; }
+    ce = cudaMalloc(&g_moe_scratch_down, (size_t)down_bytes);
+    if (ce != cudaSuccess) { fprintf(stderr, "ds4: MoE scratch down alloc failed\n"); (void)cudaFree(g_moe_scratch_gate); (void)cudaFree(g_moe_scratch_up); g_moe_scratch_gate = g_moe_scratch_up = NULL; (void)cudaGetLastError(); return; }
+    g_moe_scratch_gate_bytes = gate_bytes;
+    g_moe_scratch_up_bytes = up_bytes;
+    g_moe_scratch_down_bytes = down_bytes;
+    g_moe_scratch_inited = 1;
+    /* Allocate pinned host staging buffer for async H2D copies */
+    uint64_t staging = gate_bytes + up_bytes + down_bytes;
+    if (staging > g_moe_staging_bytes) {
+        if (g_moe_staging_host) cudaFreeHost(g_moe_staging_host);
+        g_moe_staging_host = NULL;
+        g_moe_staging_bytes = 0;
+        ce = cudaMallocHost(&g_moe_staging_host, (size_t)staging);
+        if (ce == cudaSuccess) {
+            g_moe_staging_bytes = staging;
+        } else {
+            fprintf(stderr, "ds4: MoE staging alloc failed, falling back to synchronous copies\n");
+            (void)cudaGetLastError();
+        }
+    }
+    fprintf(stderr, "ds4: MoE persistent scratch allocated (gate=%.2f up=%.2f down=%.2f MiB)\n",
+            (double)gate_bytes / 1048576.0, (double)up_bytes / 1048576.0, (double)down_bytes / 1048576.0);
+}
+
 extern "C" void ds4_gpu_cleanup(void) {
     (void)cudaDeviceSynchronize();
     if (g_cublas_ready) {
@@ -1636,6 +1739,15 @@ extern "C" void ds4_gpu_cleanup(void) {
         g_cuda_decode_graph = NULL;
     }
     g_cuda_decode_graph_captured = 0;
+    if (g_moe_scratch_gate) { (void)cudaFree(g_moe_scratch_gate); g_moe_scratch_gate = NULL; }
+    if (g_moe_scratch_up)   { (void)cudaFree(g_moe_scratch_up);   g_moe_scratch_up = NULL; }
+    if (g_moe_scratch_down) { (void)cudaFree(g_moe_scratch_down); g_moe_scratch_down = NULL; }
+    if (g_moe_staging_host) { (void)cudaFreeHost(g_moe_staging_host); g_moe_staging_host = NULL; }
+    g_moe_staging_bytes = 0;
+    g_moe_scratch_gate_bytes = 0;
+    g_moe_scratch_up_bytes = 0;
+    g_moe_scratch_down_bytes = 0;
+    g_moe_scratch_inited = 0;
 }
 
 __global__ static void fill_f32_kernel(float *x, uint64_t n, float v);
@@ -1761,8 +1873,24 @@ extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
 }
 
 extern "C" int ds4_gpu_begin_commands(void) { return 1; }
-extern "C" int ds4_gpu_flush_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "flush"); }
-extern "C" int ds4_gpu_end_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "end commands"); }
+extern "C" int ds4_gpu_flush_commands(void) {
+    if (g_cuda_decode_stream_created) {
+        cudaStreamCaptureStatus status;
+        cudaError_t ce = cudaStreamIsCapturing(g_cuda_decode_stream, &status);
+        if (ce == cudaSuccess && status == cudaStreamCaptureStatusActive) return 1;
+        (void)cudaGetLastError();
+    }
+    return cuda_ok(cudaDeviceSynchronize(), "flush");
+}
+extern "C" int ds4_gpu_end_commands(void) {
+    if (g_cuda_decode_stream_created) {
+        cudaStreamCaptureStatus status;
+        cudaError_t ce = cudaStreamIsCapturing(g_cuda_decode_stream, &status);
+        if (ce == cudaSuccess && status == cudaStreamCaptureStatusActive) return 1;
+        (void)cudaGetLastError();
+    }
+    return cuda_ok(cudaDeviceSynchronize(), "end commands");
+}
 extern "C" int ds4_gpu_synchronize(void) { return cuda_ok(cudaDeviceSynchronize(), "synchronize"); }
 
 extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {

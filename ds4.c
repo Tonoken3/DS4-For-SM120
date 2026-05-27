@@ -13679,23 +13679,27 @@ static bool metal_graph_eval_token_raw_swa(
     double t_encoded = (profile || throttle) ? now_sec() : 0.0;
 
     if (graph_mode && ds4_gpu_decode_graph_captured()) {
-        /* Replay the captured graph — params already staged on host,
-         * push to device, then submit graph launch. */
+        double r0 = profile ? now_sec() : 0.0;
         ok = ok && ds4_gpu_decode_params_push(g->cuda_params_host);
+        double r1 = profile ? now_sec() : 0.0;
         ok = ok && ds4_gpu_decode_graph_launch();
+        double r2 = profile ? now_sec() : 0.0;
+        if (profile) fprintf(stderr, "ds4: graph replay push=%.3f launch=%.3f ms\n",
+                             (r1 - r0) * 1000.0, (r2 - r1) * 1000.0);
         if (profile) t_encoded = now_sec();
     } else if (graph_mode && g->cuda_params_host && pos > 10) {
-        /* First decode (pos > prefill end): warm all weight caches, then capture.
-         * The token_embd and other weights are cached during the normal decode
-         * below, and the SECOND decode uses graph capture/replay. */
+        /* Capture the decode graph */
+        fprintf(stderr, "ds4: graph capture path pos=%u\n", pos);
         ok = ok && ds4_gpu_decode_graph_capture();
         if (ok) ok = ds4_gpu_decode_params_push(g->cuda_params_host);
         if (ok) ok = metal_graph_encode_token_raw_swa(g, model, weights,
                                                       token, pos, logits != NULL, true);
         if (profile) t_encoded = now_sec();
         if (ok) ok = ds4_gpu_decode_graph_capture_end();
+        else fprintf(stderr, "ds4: graph capture failed (ok=%d)\n", ok);
     } else {
-        /* Normal encode (no graph mode, or first token where weights are cold) */
+        /* Normal encode */
+        fprintf(stderr, "ds4: graph normal path pos=%u graph_mode=%d host=%p\n", pos, graph_mode, (void*)g->cuda_params_host);
         if (ok) ok = metal_graph_encode_token_raw_swa(g, model, weights,
                                                       token, pos, logits != NULL, true);
         if (profile) t_encoded = now_sec();
@@ -18317,6 +18321,22 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         }
         fprintf(stderr, "ds4: %s backend initialized for graph diagnostics\n",
                 ds4_backend_name(e->backend));
+#ifndef DS4_NO_GPU
+        /* Initialize persistent MoE scratch buffer for graph-compatible
+         * transient weight loading. One layer's full expert weights. */
+        const ds4_tensor *tg = e->weights.layer[0].ffn_gate_exps;
+        const ds4_tensor *td = e->weights.layer[0].ffn_down_exps;
+        if (tg && td) {
+            const uint64_t grb = routed_expert_row_bytes(tg);
+            const uint64_t drb = routed_expert_row_bytes(td);
+            const uint64_t geb = DS4_N_FF_EXP * grb;   /* per-expert gate bytes */
+            const uint64_t deb = DS4_N_EMBD * drb;      /* per-expert down bytes */
+            ds4_gpu_init_moe_scratch(
+                (uint64_t)DS4_N_EXPERT * geb,   /* all 256 experts' gate */
+                (uint64_t)DS4_N_EXPERT * geb,   /* all 256 experts' up */
+                (uint64_t)DS4_N_EXPERT * deb);  /* all 256 experts' down */
+        }
+#endif
     }
 #else
     if (graph_backend) {

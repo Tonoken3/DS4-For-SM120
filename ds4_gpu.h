@@ -849,6 +849,11 @@ void ds4_gpu_decode_params_free(ds4_cuda_decode_params *host,
                                 void                    *device,
                                 uint64_t                 bytes);
 
+/* Persistent MoE scratch buffer (one layer's full expert weights).
+ * Must be called after model loading when dimensions are known.
+ * Safe to call multiple times — subsequent calls are no-ops. */
+void ds4_gpu_init_moe_scratch(uint64_t gate_bytes, uint64_t up_bytes, uint64_t down_bytes);
+
 /* Push host params to the device global symbol (kernel-visible).
  * Returns 1 on success. Must be called before graph launch. */
 int ds4_gpu_decode_params_push(const ds4_cuda_decode_params *host);

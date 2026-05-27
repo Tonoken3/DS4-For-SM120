@@ -11903,8 +11903,6 @@ static bool metal_graph_encode_token_raw_swa_pp(
     const uint32_t n_raw = metal_graph_raw_span_for_batch(g0, pos, 1);
 
     ds4_gpu_pp_set_device(0);
-    ds4_gpu_debug_tensor_ptr("g0->cur_hc", g0->cur_hc);
-    ds4_gpu_debug_tensor_ptr("g0->flat_hc", g0->flat_hc);
     bool ok = ds4_gpu_embed_token_hc_tensor(g0->cur_hc,
                                               model->map,
                                               model->size,
@@ -11939,6 +11937,8 @@ static bool metal_graph_encode_token_raw_swa_pp(
                 ds4_gpu_tensor_contents(pp[gp + 1].g.cur_hc),
                 ds4_gpu_tensor_contents(gg->after_ffn_hc),
                 ds4_gpu_tensor_bytes(gg->after_ffn_hc));
+            /* P2P copy is async on the default stream; synchronize before next GPU runs kernels */
+            ds4_gpu_synchronize();
         }
     }
 
@@ -11948,6 +11948,8 @@ static bool metal_graph_encode_token_raw_swa_pp(
             ds4_gpu_tensor_contents(g0->cur_hc),
             ds4_gpu_tensor_contents(pp[last].g.after_ffn_hc),
             ds4_gpu_tensor_bytes(pp[last].g.after_ffn_hc));
+        /* Ensure P2P copy to GPU0 completes before GPU0 reads g0->cur_hc in output_head */
+        ds4_gpu_synchronize();
         ds4_gpu_pp_set_device(0);
         ok = metal_graph_encode_output_head(g0, model, weights, weights->output->dim[1]);
     }

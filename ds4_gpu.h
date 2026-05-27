@@ -119,6 +119,10 @@ int ds4_gpu_indexer_topk_tensor(
         uint32_t                n_comp,
         uint32_t                n_tokens,
         uint32_t                top_k);
+int ds4_gpu_argmax_tensor(
+        ds4_gpu_tensor       *selected,
+        const ds4_gpu_tensor *scores,
+        uint32_t                n_comp);
 
 int ds4_gpu_dsv4_topk_mask_tensor(
         ds4_gpu_tensor       *mask,
@@ -882,6 +886,11 @@ typedef enum {
 
 int ds4_gpu_decode_graph_patch_pre(int layer, uint32_t pos, uint32_t raw_row, uint32_t n_raw);
 int ds4_gpu_decode_graph_patch_post(int layer, uint32_t pos);
+int ds4_gpu_pp_chunk_graph_capture_begin(int gpu);
+int ds4_gpu_pp_chunk_graph_capture_end(int gpu);
+int ds4_gpu_pp_chunk_graph_capture_abort(int gpu);
+int ds4_gpu_pp_chunk_graph_launch(int gpu);
+int ds4_gpu_pp_chunk_graph_ready(int gpu);
 
 /* PP (Pipeline Parallelism) export API */
 int ds4_gpu_pp_set_device(int g);
@@ -889,6 +898,7 @@ int ds4_gpu_pp_enabled(void);
 int ds4_gpu_pp_requested(void);
 int ds4_gpu_pp_resident_ready(void);
 int ds4_gpu_pp_enable_decode(void);
+int ds4_gpu_pp_work_streams_enable(int enable);
 int ds4_gpu_pp_ngpu(void);
 int ds4_gpu_pp_layer_start(int g);
 int ds4_gpu_pp_layer_end(int g);

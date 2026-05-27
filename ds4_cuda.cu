@@ -103,14 +103,22 @@ static uint64_t g_cublas_workspace_bytes;
 /* Pipeline Parallelism (PP) state — forward declarations for ds4_decode_stream */
 static int g_pp_decode_active;
 static cudaStream_t g_pp_stream[DS4_CUDA_MAX_DEVICES];
+static int g_pp_work_streams_enabled;
 
 static cudaStream_t ds4_decode_stream(void) {
-    if (!g_cuda_decode_stream_created) return 0;
-    /* In PP mode, only GPU 0's decode stream is valid.
-     * Other GPUs must use their default stream (0). */
     if (getenv("DS4_CUDA_PP_DEFAULT_STREAM") != NULL) return 0;
     int dev = 0;
-    if (cudaGetDevice(&dev) == cudaSuccess && dev != 0) return 0;
+    if (cudaGetDevice(&dev) == cudaSuccess) {
+        if (g_pp_decode_active && g_pp_work_streams_enabled &&
+            dev >= 0 && dev < DS4_CUDA_MAX_DEVICES && g_pp_stream[dev]) {
+            return g_pp_stream[dev];
+        }
+        if (!g_cuda_decode_stream_created) return 0;
+        /* In legacy PP mode, only GPU 0's decode stream is valid.
+         * Other GPUs use their default stream unless PP work streams are enabled. */
+        if (dev != 0) return 0;
+    }
+    if (!g_cuda_decode_stream_created) return 0;
     return g_cuda_decode_stream;
 }
 
@@ -120,6 +128,9 @@ static cudaGraphExec_t g_cuda_decode_graph_exec;
 static int g_cuda_decode_graph_captured;
 static cudaGraphExec_t g_sub_graph_exec[2][43];
 static int g_sub_graph_exec_ready[2][43];
+static cudaGraph_t g_pp_chunk_graph[DS4_CUDA_MAX_DEVICES];
+static cudaGraphExec_t g_pp_chunk_graph_exec[DS4_CUDA_MAX_DEVICES];
+static int g_pp_chunk_graph_ready[DS4_CUDA_MAX_DEVICES];
 /* Phase E: kernel patch records */
 typedef struct {
     cudaGraphNode_t node;
@@ -286,6 +297,100 @@ extern "C" int ds4_gpu_decode_graph_capture_end_store(int part, int layer) {
 extern "C" int ds4_gpu_decode_subgraph_launch(int part, int layer) {
     if (layer < 0 || layer >= 43 || !g_sub_graph_exec[part][layer]) return 0;
     return cudaGraphLaunch(g_sub_graph_exec[part][layer], ds4_decode_stream()) == cudaSuccess ? 1 : 0;
+}
+
+extern "C" int ds4_gpu_pp_chunk_graph_capture_begin(int gpu) {
+    if (gpu < 0 || gpu >= DS4_CUDA_MAX_DEVICES || !g_pp_stream[gpu]) return 0;
+    cudaSetDevice(gpu);
+    cudaStream_t stream = ds4_decode_stream();
+    if (!stream) {
+        fprintf(stderr, "ds4: PP chunk graph capture begin failed gpu%d: no PP work stream\n", gpu);
+        return 0;
+    }
+    cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
+    cudaError_t se = cudaStreamIsCapturing(stream, &st);
+    if (se == cudaSuccess && st != cudaStreamCaptureStatusNone) {
+        fprintf(stderr, "ds4: PP chunk graph capture skipped gpu%d: stream already capturing status=%d\n",
+                gpu, (int)st);
+        return 0;
+    }
+    (void)cudaGetLastError();
+    if (g_pp_chunk_graph_exec[gpu]) {
+        (void)cudaGraphExecDestroy(g_pp_chunk_graph_exec[gpu]);
+        g_pp_chunk_graph_exec[gpu] = NULL;
+    }
+    if (g_pp_chunk_graph[gpu]) {
+        (void)cudaGraphDestroy(g_pp_chunk_graph[gpu]);
+        g_pp_chunk_graph[gpu] = NULL;
+    }
+    g_pp_chunk_graph_ready[gpu] = 0;
+    cudaError_t ce = cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal);
+    if (ce != cudaSuccess) {
+        fprintf(stderr, "ds4: PP chunk graph capture begin failed gpu%d: %s\n",
+                gpu, cudaGetErrorString(ce));
+        (void)cudaGetLastError();
+        return 0;
+    }
+    return 1;
+}
+
+extern "C" int ds4_gpu_pp_chunk_graph_capture_end(int gpu) {
+    if (gpu < 0 || gpu >= DS4_CUDA_MAX_DEVICES || !g_pp_stream[gpu]) return 0;
+    cudaSetDevice(gpu);
+    cudaStream_t stream = ds4_decode_stream();
+    if (!stream) return 0;
+    cudaGraph_t graph = NULL;
+    cudaError_t ce = cudaStreamEndCapture(stream, &graph);
+    if (ce != cudaSuccess || !graph) {
+        fprintf(stderr, "ds4: PP chunk graph capture end failed gpu%d: %s\n",
+                gpu, cudaGetErrorString(ce));
+        if (graph) (void)cudaGraphDestroy(graph);
+        (void)cudaGetLastError();
+        return 0;
+    }
+    ce = cudaGraphInstantiate(&g_pp_chunk_graph_exec[gpu], graph, NULL, NULL, 0);
+    if (ce != cudaSuccess) {
+        fprintf(stderr, "ds4: PP chunk graph instantiate failed gpu%d: %s\n",
+                gpu, cudaGetErrorString(ce));
+        (void)cudaGraphDestroy(graph);
+        (void)cudaGetLastError();
+        return 0;
+    }
+    g_pp_chunk_graph[gpu] = graph;
+    g_pp_chunk_graph_ready[gpu] = 1;
+    fprintf(stderr, "ds4: PP chunk graph captured gpu%d\n", gpu);
+    return 1;
+}
+
+extern "C" int ds4_gpu_pp_chunk_graph_capture_abort(int gpu) {
+    if (gpu < 0 || gpu >= DS4_CUDA_MAX_DEVICES || !g_pp_stream[gpu]) return 0;
+    cudaSetDevice(gpu);
+    cudaStream_t stream = ds4_decode_stream();
+    if (!stream) return 0;
+    cudaGraph_t graph = NULL;
+    cudaError_t ce = cudaStreamEndCapture(stream, &graph);
+    if (graph) (void)cudaGraphDestroy(graph);
+    if (ce != cudaSuccess) (void)cudaGetLastError();
+    return 1;
+}
+
+extern "C" int ds4_gpu_pp_chunk_graph_launch(int gpu) {
+    if (gpu < 0 || gpu >= DS4_CUDA_MAX_DEVICES || !g_pp_chunk_graph_ready[gpu] ||
+        !g_pp_chunk_graph_exec[gpu]) return 0;
+    cudaSetDevice(gpu);
+    cudaError_t ce = cudaGraphLaunch(g_pp_chunk_graph_exec[gpu], ds4_decode_stream());
+    if (ce != cudaSuccess) {
+        fprintf(stderr, "ds4: PP chunk graph launch failed gpu%d: %s\n",
+                gpu, cudaGetErrorString(ce));
+        (void)cudaGetLastError();
+        return 0;
+    }
+    return 1;
+}
+
+extern "C" int ds4_gpu_pp_chunk_graph_ready(int gpu) {
+    return gpu >= 0 && gpu < DS4_CUDA_MAX_DEVICES &&
+           g_pp_chunk_graph_ready[gpu] && g_pp_chunk_graph_exec[gpu] != NULL;
 }
 
 extern "C" int ds4_gpu_decode_graph_patch_pre(int layer, uint32_t pos, uint32_t raw_row, uint32_t n_raw) {
@@ -802,6 +907,19 @@ static const char *cuda_model_temp_range_alloc(
     }
 
     void *dev = NULL;
+    if (getenv("DS4_CUDA_MTP_TRACE_ALLOC") != NULL) {
+        int cur_dev = -1;
+        size_t free_b = 0, total_b = 0;
+        (void)cudaGetDevice(&cur_dev);
+        (void)cudaMemGetInfo(&free_b, &total_b);
+        fprintf(stderr,
+                "ds4: CUDA MTP trace transient alloc request dev=%d %s %.2f MiB free %.2f/%.2f MiB\n",
+                cur_dev,
+                what ? what : "weights",
+                (double)bytes / 1048576.0,
+                (double)free_b / 1048576.0,
+                (double)total_b / 1048576.0);
+    }
     cudaError_t err = cudaMalloc(&dev, (size_t)bytes);
     if (err != cudaSuccess) {
         fprintf(stderr, "ds4: CUDA transient model alloc failed for %s (%.2f MiB): %s\n",
@@ -2038,6 +2156,10 @@ extern "C" int ds4_gpu_pp_enable_decode(void) {
     g_pp_decode_active = 1;
     return 1;
 }
+extern "C" int ds4_gpu_pp_work_streams_enable(int enable) {
+    g_pp_work_streams_enabled = enable ? 1 : 0;
+    return 1;
+}
 extern "C" int ds4_gpu_pp_ngpu(void) { return g_pp_ngpu; }
 extern "C" int ds4_gpu_pp_layer_start(int g) { return (g >= 0 && g < g_pp_ngpu) ? g_pp_layer_start[g] : -1; }
 extern "C" int ds4_gpu_pp_layer_end(int g) { return (g >= 0 && g < g_pp_ngpu) ? g_pp_layer_end[g] : -1; }
@@ -2289,6 +2411,17 @@ extern "C" void ds4_gpu_cleanup(void) {
         g_cuda_decode_graph = NULL;
     }
     g_cuda_decode_graph_captured = 0;
+    for (int g = 0; g < DS4_CUDA_MAX_DEVICES; g++) {
+        if (g_pp_chunk_graph_exec[g]) {
+            (void)cudaGraphExecDestroy(g_pp_chunk_graph_exec[g]);
+            g_pp_chunk_graph_exec[g] = NULL;
+        }
+        if (g_pp_chunk_graph[g]) {
+            (void)cudaGraphDestroy(g_pp_chunk_graph[g]);
+            g_pp_chunk_graph[g] = NULL;
+        }
+        g_pp_chunk_graph_ready[g] = 0;
+    }
     for (int p = 0; p < 2; p++) for (int i = 0; i < 43; i++) {
         if (g_sub_graph_exec[p][i]) { (void)cudaGraphExecDestroy(g_sub_graph_exec[p][i]); g_sub_graph_exec[p][i] = NULL; }
         g_sub_graph_exec_ready[p][i] = 0;
@@ -6148,6 +6281,86 @@ __device__ __forceinline__ static bool topk_score_better(float av, uint32_t ai, 
     return av > bv || (av == bv && ai < bi);
 }
 
+__global__ static void argmax_stage1_kernel(
+        float *block_vals,
+        uint32_t *block_idxs,
+        const float *scores,
+        uint32_t n_comp) {
+    uint32_t tid = threadIdx.x;
+    float best_v = -1.0e30f;
+    uint32_t best_i = 0;
+    for (uint32_t i = blockIdx.x * blockDim.x + tid;
+         i < n_comp;
+         i += blockDim.x * gridDim.x) {
+        const float v = scores[i];
+        if (v > best_v) {
+            best_v = v;
+            best_i = i;
+        }
+    }
+
+    __shared__ float vals[256];
+    __shared__ uint32_t idxs[256];
+    vals[tid] = best_v;
+    idxs[tid] = best_i;
+    __syncthreads();
+
+    for (uint32_t stride = blockDim.x >> 1u; stride > 0; stride >>= 1u) {
+        if (tid < stride) {
+            const float ov = vals[tid + stride];
+            const uint32_t oi = idxs[tid + stride];
+            if (topk_score_better(ov, oi, vals[tid], idxs[tid])) {
+                vals[tid] = ov;
+                idxs[tid] = oi;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        block_vals[blockIdx.x] = vals[0];
+        block_idxs[blockIdx.x] = idxs[0];
+    }
+}
+
+__global__ static void argmax_stage2_kernel(
+        uint32_t *selected,
+        const float *block_vals,
+        const uint32_t *block_idxs,
+        uint32_t n_blocks) {
+    uint32_t tid = threadIdx.x;
+    float best_v = -1.0e30f;
+    uint32_t best_i = 0;
+    for (uint32_t i = tid; i < n_blocks; i += blockDim.x) {
+        const float v = block_vals[i];
+        const uint32_t idx = block_idxs[i];
+        if (topk_score_better(v, idx, best_v, best_i)) {
+            best_v = v;
+            best_i = idx;
+        }
+    }
+
+    __shared__ float vals[256];
+    __shared__ uint32_t idxs[256];
+    vals[tid] = best_v;
+    idxs[tid] = best_i;
+    __syncthreads();
+
+    for (uint32_t stride = blockDim.x >> 1u; stride > 0; stride >>= 1u) {
+        if (tid < stride) {
+            const float ov = vals[tid + stride];
+            const uint32_t oi = idxs[tid + stride];
+            if (topk_score_better(ov, oi, vals[tid], idxs[tid])) {
+                vals[tid] = ov;
+                idxs[tid] = oi;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) selected[0] = idxs[0];
+}
+
 __device__ __forceinline__ static uint32_t topk_float_ordered_key(float v) {
     const uint32_t u = __float_as_uint(v);
     return (u & 0x80000000u) ? ~u : (u ^ 0x80000000u);
@@ -6997,6 +7210,45 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                                          (const float *)scores->ptr,
                                          n_comp, n_tokens, top_k);
     return cuda_ok(cudaGetLastError(), "indexer topk launch");
+}
+
+extern "C" int ds4_gpu_argmax_tensor(
+        ds4_gpu_tensor       *selected,
+        const ds4_gpu_tensor *scores,
+        uint32_t                n_comp) {
+    if (!selected || !scores || n_comp == 0 ||
+        scores->bytes < (uint64_t)n_comp * sizeof(float) ||
+        selected->bytes < sizeof(uint32_t)) {
+        return 0;
+    }
+
+    const uint32_t threads = 256u;
+    uint32_t blocks = (n_comp + threads - 1u) / threads;
+    if (blocks == 0) blocks = 1;
+    if (blocks > 1024u) blocks = 1024u;
+
+    const uint64_t vals_bytes = (uint64_t)blocks * sizeof(float);
+    const uint64_t idx_offset = (vals_bytes + 15u) & ~15ull;
+    const uint64_t idx_bytes = (uint64_t)blocks * sizeof(uint32_t);
+    uint8_t *scratch = (uint8_t *)cuda_tmp_alloc(idx_offset + idx_bytes, "argmax");
+    if (!scratch) return 0;
+
+    float *block_vals = (float *)scratch;
+    uint32_t *block_idxs = (uint32_t *)(scratch + idx_offset);
+    cudaStream_t s = ds4_decode_stream();
+    argmax_stage1_kernel<<<blocks, threads, 0, s>>>(
+            block_vals,
+            block_idxs,
+            (const float *)scores->ptr,
+            n_comp);
+    if (!cuda_ok(cudaGetLastError(), "argmax stage1 launch")) return 0;
+
+    argmax_stage2_kernel<<<1, threads, 0, s>>>(
+            (uint32_t *)selected->ptr,
+            block_vals,
+            block_idxs,
+            blocks);
+    return cuda_ok(cudaGetLastError(), "argmax stage2 launch");
 }
 
 extern "C" int ds4_gpu_dsv4_topk_mask_tensor(
@@ -11116,6 +11368,25 @@ static int routed_moe_launch(
         !g_model_device_owned &&
         !g_model_registered &&
         !cuda_model_direct_host_access_allowed();
+    if (getenv("DS4_CUDA_MTP_TRACE_ALLOC") != NULL) {
+        int cur_dev = -1;
+        size_t free_b = 0, total_b = 0;
+        (void)cudaGetDevice(&cur_dev);
+        (void)cudaMemGetInfo(&free_b, &total_b);
+        fprintf(stderr,
+                "ds4: CUDA MTP trace routed_moe dev=%d n_tokens=%u n_expert=%u/%u q4k=%d use_temp=%d gate=%.2f MiB up=%.2f MiB down=%.2f MiB free %.2f/%.2f MiB\n",
+                cur_dev,
+                n_tokens,
+                n_expert,
+                n_total_expert,
+                q4k_path,
+                use_temp_weights,
+                (double)gate_bytes / 1048576.0,
+                (double)gate_bytes / 1048576.0,
+                (double)down_bytes / 1048576.0,
+                (double)free_b / 1048576.0,
+                (double)total_b / 1048576.0);
+    }
 
     /* Selected-expert compact copy: for decode (1 token, 6 experts), copy only
      * the 6 selected experts into a pre-allocated scratch instead of all 256.

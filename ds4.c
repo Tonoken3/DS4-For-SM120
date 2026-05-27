@@ -11899,13 +11899,26 @@ static bool metal_graph_encode_token_raw_swa(
     return ok;
 }
 
+#define DS4_PP_PROFILE_MAX_GPU 16
+
+typedef struct {
+    uint32_t pos;
+    int ngpu;
+    int async_p2p;
+    double embed_ms;
+    double gpu_ms[DS4_PP_PROFILE_MAX_GPU];
+    double p2p_ms[DS4_PP_PROFILE_MAX_GPU];
+    double output_ms;
+} ds4_pp_profile;
+
 static bool metal_graph_encode_token_raw_swa_pp(
         ds4_pp_gpu *pp, int ngpu,
         const ds4_model *model,
         const ds4_weights *weights,
         int token,
         uint32_t pos,
-        bool need_logits) {
+        bool need_logits,
+        ds4_pp_profile *pp_profile) {
     ds4_gpu_graph *g0 = &pp[0].g;
     if (g0->raw_cap == 0) {
         fprintf(stderr, "ds4: PP raw KV cache is not allocated\n");
@@ -11914,8 +11927,18 @@ static bool metal_graph_encode_token_raw_swa_pp(
     const uint32_t raw_row = pos % g0->raw_cap;
     const uint32_t n_raw = metal_graph_raw_span_for_batch(g0, pos, 1);
     const bool async_p2p = getenv("DS4_CUDA_PP_ASYNC_P2P") != NULL;
+    const bool graph_chunks = getenv("DS4_CUDA_PP_GRAPH_CHUNKS_CAPTURE") != NULL;
+    const bool graph_replay = getenv("DS4_CUDA_PP_GRAPH_CHUNKS_REPLAY") != NULL;
+    const bool profile = pp_profile != NULL;
+    if (profile) {
+        memset(pp_profile, 0, sizeof(*pp_profile));
+        pp_profile->pos = pos;
+        pp_profile->ngpu = ngpu;
+        pp_profile->async_p2p = async_p2p ? 1 : 0;
+    }
 
     ds4_gpu_pp_set_device(0);
+    const double t_embed0 = profile ? now_sec() : 0.0;
     ds4_debug_decode_symbol_token("pp_embed_before", (uint32_t)token, (uint32_t)weights->token_embd->dim[1]);
     bool ok = ds4_gpu_embed_token_hc_tensor(g0->cur_hc,
                                               model->map,
@@ -11926,42 +11949,78 @@ static bool metal_graph_encode_token_raw_swa_pp(
                                               DS4_N_EMBD,
                                               DS4_N_HC) != 0;
     if (ok) ok = ds4_gpu_synchronize() != 0;
+    if (profile) pp_profile->embed_ms = (now_sec() - t_embed0) * 1000.0;
     if (!ok) fprintf(stderr, "ds4: PP embed token failed\n");
 
     for (int gp = 0; ok && gp < ngpu; gp++) {
         ds4_gpu_pp_set_device(gp);
         ds4_gpu_graph *gg = &pp[gp].g;
-        for (int il = pp[gp].layer_start; ok && il <= pp[gp].layer_end; il++) {
-            ok = metal_graph_encode_decode_layer(gg,
-                                                 model,
-                                                 &weights->layer[il],
-                                                 (uint32_t)il,
-                                                 pos,
-                                                 gg->layer_raw_cache[il],
-                                                 gg->raw_cap,
-                                                 raw_row,
-                                                 n_raw,
-                                                 token, false, 0);
-            ds4_gpu_tensor *tmp = gg->cur_hc;
-            gg->cur_hc = gg->after_ffn_hc;
-            gg->after_ffn_hc = tmp;
+        const double t_gpu0 = profile ? now_sec() : 0.0;
+        const bool chunk_graph_candidate = graph_chunks && gp > 0 && gp + 1 < ngpu;
+        if (chunk_graph_candidate && graph_replay && ds4_gpu_pp_chunk_graph_ready(gp)) {
+            ok = ds4_gpu_pp_chunk_graph_launch(gp) != 0;
+            const int n_chunk_layers = pp[gp].layer_end - pp[gp].layer_start + 1;
+            if (ok && (n_chunk_layers & 1)) {
+                ds4_gpu_tensor *tmp = gg->cur_hc;
+                gg->cur_hc = gg->after_ffn_hc;
+                gg->after_ffn_hc = tmp;
+            }
+        } else {
+            bool capturing = false;
+            if (chunk_graph_candidate && !ds4_gpu_pp_chunk_graph_ready(gp) && pos > 10) {
+                capturing = ds4_gpu_pp_chunk_graph_capture_begin(gp) != 0;
+            }
+            for (int il = pp[gp].layer_start; ok && il <= pp[gp].layer_end; il++) {
+                ok = metal_graph_encode_decode_layer(gg,
+                                                     model,
+                                                     &weights->layer[il],
+                                                     (uint32_t)il,
+                                                     pos,
+                                                     gg->layer_raw_cache[il],
+                                                     gg->raw_cap,
+                                                     raw_row,
+                                                     n_raw,
+                                                     token, false, 0);
+                ds4_gpu_tensor *tmp = gg->cur_hc;
+                gg->cur_hc = gg->after_ffn_hc;
+                gg->after_ffn_hc = tmp;
+            }
+            if (capturing) {
+                if (ok) ok = ds4_gpu_pp_chunk_graph_capture_end(gp) != 0;
+                else (void)ds4_gpu_pp_chunk_graph_capture_abort(gp);
+            }
+        }
+        if (profile) {
+            ds4_gpu_pp_set_device(gp);
+            if (ok) ok = ds4_gpu_synchronize() != 0;
+            if (gp >= 0 && gp < DS4_PP_PROFILE_MAX_GPU) {
+                pp_profile->gpu_ms[gp] = (now_sec() - t_gpu0) * 1000.0;
+            }
         }
         if (ok && gp + 1 < ngpu) {
             /* After the layer loop, cur_hc holds the final output of this GPU.
                The async path records on the source work stream, copies on the
                destination PP stream, then makes the destination work stream
                wait before the next GPU consumes the activation. */
+            const double t_p2p0 = profile ? now_sec() : 0.0;
             if (async_p2p) {
                 ok = ds4_gpu_pp_p2p_copy_ordered_async(gp + 1, gp,
                     ds4_gpu_tensor_device_ptr(pp[gp + 1].g.cur_hc),
                     ds4_gpu_tensor_device_ptr(gg->cur_hc),
                     ds4_gpu_tensor_bytes(gg->cur_hc)) != 0;
+                if (profile && ok) {
+                    ds4_gpu_pp_set_device(gp + 1);
+                    ok = ds4_gpu_synchronize() != 0;
+                }
             } else {
                 ds4_gpu_synchronize();
                 ok = ds4_gpu_pp_p2p_copy_ptr(gp + 1, gp,
                     ds4_gpu_tensor_device_ptr(pp[gp + 1].g.cur_hc),
                     ds4_gpu_tensor_device_ptr(gg->cur_hc),
                     ds4_gpu_tensor_bytes(gg->cur_hc)) != 0;
+            }
+            if (profile && gp >= 0 && gp < DS4_PP_PROFILE_MAX_GPU) {
+                pp_profile->p2p_ms[gp] = (now_sec() - t_p2p0) * 1000.0;
             }
         }
     }
@@ -11972,7 +12031,12 @@ static bool metal_graph_encode_token_raw_swa_pp(
          * The last GPU's cur_hc already holds the final activation after
          * the last layer swap, so no P2P copy is needed. */
         ds4_gpu_pp_set_device(last);
+        const double t_output0 = profile ? now_sec() : 0.0;
         ok = metal_graph_encode_output_head(&pp[last].g, model, weights, weights->output->dim[1]);
+        if (profile) {
+            if (ok) ok = ds4_gpu_synchronize() != 0;
+            pp_profile->output_ms = (now_sec() - t_output0) * 1000.0;
+        }
     }
     ds4_gpu_pp_set_device(0);
     return ok;
@@ -13941,12 +14005,14 @@ static bool metal_graph_eval_token_raw_swa(
         int                    token,
         uint32_t               pos,
         float                 *logits) {
-    const bool profile = getenv("DS4_METAL_GRAPH_TOKEN_PROFILE") != NULL ||
+    const bool pp_token_profile = getenv("DS4_CUDA_PP_PROFILE") != NULL;
+    const bool profile = pp_token_profile ||
+                         getenv("DS4_METAL_GRAPH_TOKEN_PROFILE") != NULL ||
                          getenv("DS4_CUDA_DECODE_GRAPH_PROFILE") != NULL;
     const bool throttle = graph_power_throttle_enabled(g);
     const double t0 = (profile || throttle) ? now_sec() : 0.0;
     const bool graph_mode = getenv("DS4_CUDA_DECODE_GRAPH") != NULL;
-    const bool pp_mode = ds4_gpu_pp_enabled();
+    const bool pp_mode = ds4_gpu_pp_enabled() && g_pp_graphs && g_pp_graphs_ngpu > 0;
     const bool graph_capture_mode = graph_mode && g->cuda_params_host &&
                                     ds4_gpu_decode_graph_can_capture() != 0;
 
@@ -13973,8 +14039,22 @@ static bool metal_graph_eval_token_raw_swa(
 
     /* PP decode: per-GPU layer encode with local KV caches and P2P activation transfers */
     if (pp_mode && ok) {
+        ds4_pp_profile pp_prof;
         ok = metal_graph_encode_token_raw_swa_pp(g_pp_graphs, g_pp_graphs_ngpu,
-                                                  model, weights, token, pos, logits != NULL);
+                                                  model, weights, token, pos, logits != NULL,
+                                                  pp_token_profile ? &pp_prof : NULL);
+        if (pp_token_profile && ok) {
+            fprintf(stderr, "ds4: pp token pos=%u embed=%.3f ms",
+                    pp_prof.pos, pp_prof.embed_ms);
+            for (int gp = 0; gp < pp_prof.ngpu && gp < DS4_PP_PROFILE_MAX_GPU; gp++) {
+                fprintf(stderr, " gpu%d=%.3f ms", gp, pp_prof.gpu_ms[gp]);
+                if (gp + 1 < pp_prof.ngpu) {
+                    fprintf(stderr, " p2p%d_%d=%.3f ms", gp, gp + 1, pp_prof.p2p_ms[gp]);
+                }
+            }
+            if (logits) fprintf(stderr, " output=%.3f ms", pp_prof.output_ms);
+            fprintf(stderr, " async=%d\n", pp_prof.async_p2p);
+        }
         if (profile) t_encoded = now_sec();
     } else {
         const int subgraphs_ready =
@@ -14108,21 +14188,62 @@ static bool metal_graph_eval_token_raw_swa_top(
         int                   *top_id,
         float                 *logits) {
     if (!top_id) return false;
+    const bool pp_mode = ds4_gpu_pp_enabled() && g_pp_graphs && g_pp_graphs_ngpu > 0;
+    const bool pp_token_profile = getenv("DS4_CUDA_PP_PROFILE") != NULL;
+    const double t0 = pp_token_profile ? now_sec() : 0.0;
 
     bool ok = ds4_gpu_begin_commands() != 0;
-    if (ok) ok = metal_graph_encode_token_raw_swa(g, model, weights,
-                                                  token, pos, true, true);
-    if (ok) {
-        ok = ds4_gpu_indexer_topk_tensor(g->comp_selected,
-                                           g->logits,
-                                           DS4_N_VOCAB,
-                                           1,
-                                           1) != 0;
+    ds4_gpu_graph *logits_graph = g;
+    if (ok && pp_mode) {
+        ds4_pp_profile pp_prof;
+        ok = metal_graph_encode_token_raw_swa_pp(g_pp_graphs, g_pp_graphs_ngpu,
+                                                  model, weights, token, pos, true,
+                                                  pp_token_profile ? &pp_prof : NULL);
+        if (ok && g_pp_graphs_ngpu > 0) {
+            int last = g_pp_graphs_ngpu - 1;
+            logits_graph = &g_pp_graphs[last].g;
+            ds4_gpu_pp_set_device(last);
+        }
+        if (pp_token_profile && ok) {
+            fprintf(stderr, "ds4: pp token pos=%u embed=%.3f ms",
+                    pp_prof.pos, pp_prof.embed_ms);
+            for (int gp = 0; gp < pp_prof.ngpu && gp < DS4_PP_PROFILE_MAX_GPU; gp++) {
+                fprintf(stderr, " gpu%d=%.3f ms", gp, pp_prof.gpu_ms[gp]);
+                if (gp + 1 < pp_prof.ngpu) {
+                    fprintf(stderr, " p2p%d_%d=%.3f ms", gp, gp + 1, pp_prof.p2p_ms[gp]);
+                }
+            }
+            fprintf(stderr, " output=%.3f ms async=%d\n",
+                    pp_prof.output_ms, pp_prof.async_p2p);
+        }
+    } else if (ok) {
+        ok = metal_graph_encode_token_raw_swa(g, model, weights,
+                                              token, pos, true, true);
     }
+    if (ok) {
+        ok = ds4_gpu_argmax_tensor(logits_graph->comp_selected,
+                                   logits_graph->logits,
+                                   DS4_N_VOCAB) != 0;
+    }
+    const double t_encoded = pp_token_profile ? now_sec() : 0.0;
     if (ok) ok = ds4_gpu_end_commands() != 0;
-    if (ok) ok = ds4_gpu_tensor_read(g->comp_selected, 0, top_id, sizeof(*top_id)) != 0;
+    const double t_done = pp_token_profile ? now_sec() : 0.0;
+    if (ok) ok = ds4_gpu_tensor_read(logits_graph->comp_selected, 0, top_id, sizeof(*top_id)) != 0;
     if (ok && logits) {
-        ok = ds4_gpu_tensor_read(g->logits, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+        ok = ds4_gpu_tensor_read(logits_graph->logits, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+    }
+    const double t_read = pp_token_profile ? now_sec() : 0.0;
+    if (pp_mode) ds4_gpu_pp_set_device(0);
+    if (pp_token_profile) {
+        fprintf(stderr,
+                "ds4: pp argmax token pos=%u encode=%.3f ms execute=%.3f ms read=%.3f ms total=%.3f ms top=%d logits=%d\n",
+                pos,
+                (t_encoded - t0) * 1000.0,
+                (t_done - t_encoded) * 1000.0,
+                (t_read - t_done) * 1000.0,
+                (t_read - t0) * 1000.0,
+                ok ? *top_id : -1,
+                logits != NULL);
     }
     if (!ok) {
         if (ds4_gpu_synchronize() == 0) {
@@ -16847,6 +16968,10 @@ static int generate_metal_graph_raw_swa(
     ds4_gpu_model_range_reserve();
         }
         ds4_gpu_pp_enable_decode();
+        ds4_gpu_pp_work_streams_enable(
+                getenv("DS4_CUDA_PP_WORK_STREAMS") != NULL ||
+                getenv("DS4_CUDA_PP_GRAPH_CHUNKS") != NULL ||
+                getenv("DS4_CUDA_PP_GRAPH_CHUNKS_CAPTURE") != NULL);
         {
             int ngpu_pp = ds4_gpu_pp_ngpu();
             ds4_gpu_pp_deactivate_decode_params_all(ngpu_pp);
@@ -16898,6 +17023,11 @@ static int generate_metal_graph_raw_swa(
     int pos = prompt->len;
     int n_generated = 0;
     int n_decode_eval = 0;
+    const bool gpu_argmax = getenv("DS4_CUDA_GPU_ARGMAX") != NULL && !trace_top;
+    if (gpu_argmax) {
+        fprintf(stderr, "ds4: CUDA greedy GPU argmax enabled\n");
+    }
+    int next_token = sample_argmax(logits, DS4_N_VOCAB);
     const double t_decode0 = now_sec();
     for (int i = 0; i < n_predict && pos < ctx_size; i++) {
         if (trace_top) {
@@ -16906,7 +17036,7 @@ static int generate_metal_graph_raw_swa(
             print_top_logits(stderr, label, vocab, logits, DS4_N_VOCAB, 10);
         }
 
-        int token = sample_argmax(logits, DS4_N_VOCAB);
+        int token = next_token;
         if (token == vocab->eos_id) break;
 
         if (emit) emit(emit_ud, token);
@@ -16918,12 +17048,25 @@ static int generate_metal_graph_raw_swa(
         }
 
         const double t_eval0 = token_timing ? now_sec() : 0.0;
-        ok = metal_graph_eval_token_raw_swa(&g,
-                                            model,
-                                            weights,
-                                            (uint32_t)token,
-                                            (uint32_t)pos,
-                                            logits);
+        if (gpu_argmax) {
+            int top_id = -1;
+            ok = metal_graph_eval_token_raw_swa_top(&g,
+                                                    model,
+                                                    weights,
+                                                    token,
+                                                    (uint32_t)pos,
+                                                    &top_id,
+                                                    NULL);
+            if (ok) next_token = top_id;
+        } else {
+            ok = metal_graph_eval_token_raw_swa(&g,
+                                                model,
+                                                weights,
+                                                (uint32_t)token,
+                                                (uint32_t)pos,
+                                                logits);
+            if (ok) next_token = sample_argmax(logits, DS4_N_VOCAB);
+        }
         if (!ok) break;
         if (token_timing) {
             const double t_eval1 = now_sec();

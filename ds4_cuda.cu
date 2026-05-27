@@ -351,6 +351,7 @@ static int cuda_ok(cudaError_t err, const char *what);
 static int cuda_decode_graph_enabled(void);
 static int cuda_model_direct_host_access_allowed(void);
 static int cuda_moe_temp_weights_enabled(void);
+static int cuda_cublas_decode_enabled(void);
 static const char *cuda_model_range_ptr_from_fd(
         const void *model_map,
         uint64_t offset,
@@ -525,6 +526,12 @@ static int cuda_moe_temp_weights_enabled(void) {
     }
     (void)free_bytes;
     return (uint64_t)total_bytes <= 24ull * 1024ull * 1024ull * 1024ull;
+}
+
+static int cuda_cublas_decode_enabled(void) {
+    if (getenv("DS4_CUDA_CUBLAS_DECODE_F16") != NULL) return 1;
+    if (getenv("DS4_CUDA_CUBLAS_DECODE_F32") != NULL) return 1;
+    return 0;
 }
 
 static const char *cuda_model_temp_range_alloc(

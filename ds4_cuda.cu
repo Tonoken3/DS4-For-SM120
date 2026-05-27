@@ -92,11 +92,17 @@ static cublasHandle_t g_cublas;
 static int g_cublas_ready;
 static int g_quality_mode;
 
+#define DS4_CUDA_MAX_DEVICES 16
+
 /* CUDA Graph decode infrastructure (Phase 0-1) */
 static cudaStream_t g_cuda_decode_stream;
 static int g_cuda_decode_stream_created;
 static void *g_cublas_workspace;
 static uint64_t g_cublas_workspace_bytes;
+
+/* Pipeline Parallelism (PP) state — forward declarations for ds4_decode_stream */
+static int g_pp_decode_active;
+static cudaStream_t g_pp_stream[DS4_CUDA_MAX_DEVICES];
 
 static cudaStream_t ds4_decode_stream(void) {
     if (!g_cuda_decode_stream_created) return 0;
@@ -438,7 +444,6 @@ static uint64_t g_model_load_progress_next;
 static double g_model_load_progress_last;
 static int g_model_load_progress_started;
 static int g_model_load_progress_tty;
-#define DS4_CUDA_MAX_DEVICES 16
 static void *g_cuda_tmp_dev[DS4_CUDA_MAX_DEVICES];
 static uint64_t g_cuda_tmp_bytes_dev[DS4_CUDA_MAX_DEVICES];
 static void *g_model_stage_raw[4];
@@ -453,13 +458,11 @@ static int g_pp_ngpu;
 static int g_pp_requested;
 static int g_pp_topology_ready;
 static int g_pp_resident_ready;
-static int g_pp_decode_active;
 static int g_pp_layer_start[7];
 static int g_pp_layer_end[7];
 static float *g_pp_active[7];
 static ncclComm_t g_pp_nccl_comms[7];
 static int g_pp_nccl_ready;
-static cudaStream_t g_pp_stream[DS4_CUDA_MAX_DEVICES];
 static cudaEvent_t g_pp_event[DS4_CUDA_MAX_DEVICES];
 static int g_moe_scratch_inited;
 
@@ -2030,6 +2033,34 @@ extern "C" int ds4_gpu_pp_p2p_copy_ptr(int dst_gpu, int src_gpu,
     }
     cudaError_t ce = cudaMemcpyPeer(dst_ptr, dst_gpu, src_ptr, src_gpu, (size_t)bytes);
     return ce == cudaSuccess ? 1 : 0;
+}
+
+/* Async variant: copy on a specific stream. Caller must ensure ordering via
+   cudaEventRecord/cudaStreamWaitEvent. */
+extern "C" int ds4_gpu_pp_p2p_copy_async(int dst_gpu, int src_gpu,
+                                          void *dst_ptr, void *src_ptr,
+                                          uint64_t bytes, cudaStream_t stream) {
+    if (!dst_ptr || !src_ptr || bytes == 0) return 0;
+    cudaError_t ce = cudaMemcpyPeerAsync(dst_ptr, dst_gpu, src_ptr, src_gpu, (size_t)bytes, stream);
+    return ce == cudaSuccess ? 1 : 0;
+}
+
+extern "C" int ds4_gpu_pp_event_record(int gpu) {
+    if (gpu < 0 || gpu >= DS4_CUDA_MAX_DEVICES || !g_pp_event[gpu]) return 0;
+    cudaSetDevice(gpu);
+    return cudaEventRecord(g_pp_event[gpu], g_pp_stream[gpu]) == cudaSuccess ? 1 : 0;
+}
+
+extern "C" int ds4_gpu_pp_stream_wait_event(int gpu, int event_gpu) {
+    if (gpu < 0 || gpu >= DS4_CUDA_MAX_DEVICES || !g_pp_stream[gpu]) return 0;
+    if (event_gpu < 0 || event_gpu >= DS4_CUDA_MAX_DEVICES || !g_pp_event[event_gpu]) return 0;
+    cudaSetDevice(gpu);
+    return cudaStreamWaitEvent(g_pp_stream[gpu], g_pp_event[event_gpu], 0) == cudaSuccess ? 1 : 0;
+}
+
+extern "C" void *ds4_gpu_pp_stream_get(int gpu) {
+    if (gpu < 0 || gpu >= DS4_CUDA_MAX_DEVICES) return NULL;
+    return g_pp_stream[gpu];
 }
 
 extern "C" void ds4_gpu_model_range_reserve(void) {

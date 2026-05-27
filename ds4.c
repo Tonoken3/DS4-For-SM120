@@ -43,6 +43,13 @@
 
 #ifndef DS4_NO_GPU
 #include "ds4_gpu.h"
+/* Forward declarations for PP async functions not in ds4_gpu.h */
+extern int ds4_gpu_pp_p2p_copy_async(int dst_gpu, int src_gpu,
+                                      void *dst_ptr, void *src_ptr,
+                                      uint64_t bytes, void *stream);
+extern int ds4_gpu_pp_event_record(int gpu);
+extern int ds4_gpu_pp_stream_wait_event(int gpu, int event_gpu);
+extern void *ds4_gpu_pp_stream_get(int gpu);
 #endif
 #if defined(__ARM_NEON)
 #include <arm_neon.h>

@@ -11904,24 +11904,16 @@ static bool metal_graph_encode_token_raw_swa_pp(
 
     ds4_gpu_pp_set_device(0);
     ds4_debug_decode_symbol_token("pp_embed_before", (uint32_t)token, (uint32_t)weights->token_embd->dim[1]);
-    /* Test: fill cur_hc with zeros to check if memory is accessible without kernel */
-    bool ok = ds4_gpu_tensor_fill_f32(g0->cur_hc, 0.0f, ds4_gpu_tensor_bytes(g0->cur_hc) / sizeof(float)) != 0;
+    bool ok = ds4_gpu_embed_token_hc_tensor(g0->cur_hc,
+                                              model->map,
+                                              model->size,
+                                              weights->token_embd->abs_offset,
+                                              (uint32_t)weights->token_embd->dim[1],
+                                              (uint32_t)token,
+                                              DS4_N_EMBD,
+                                              DS4_N_HC) != 0;
     if (ok) ok = ds4_gpu_synchronize() != 0;
-    if (!ok) {
-        fprintf(stderr, "ds4: PP memset test FAILED - memory is not accessible\n");
-    } else {
-        fprintf(stderr, "ds4: PP memset test OK - memory is accessible\n");
-        ok = ds4_gpu_embed_token_hc_tensor(g0->cur_hc,
-                                                  model->map,
-                                                  model->size,
-                                                  weights->token_embd->abs_offset,
-                                                  (uint32_t)weights->token_embd->dim[1],
-                                                  (uint32_t)token,
-                                                  DS4_N_EMBD,
-                                                  DS4_N_HC) != 0;
-        if (ok) ok = ds4_gpu_synchronize() != 0;
-        if (!ok) fprintf(stderr, "ds4: PP embed token failed\n");
-    }
+    if (!ok) fprintf(stderr, "ds4: PP embed token failed\n");
 
     for (int gp = 0; ok && gp < ngpu; gp++) {
         ds4_gpu_pp_set_device(gp);
@@ -11942,26 +11934,29 @@ static bool metal_graph_encode_token_raw_swa_pp(
             gg->after_ffn_hc = tmp;
         }
         if (ok && gp + 1 < ngpu) {
-            ds4_gpu_pp_p2p_copy_ptr(gp + 1, gp,
-                ds4_gpu_tensor_contents(pp[gp + 1].g.cur_hc),
-                ds4_gpu_tensor_contents(gg->after_ffn_hc),
-                ds4_gpu_tensor_bytes(gg->after_ffn_hc));
-            /* P2P copy is async on the default stream; synchronize before next GPU runs kernels */
+            /* After the layer loop, cur_hc holds the final output of this GPU.
+               cudaMemcpyPeer is synchronous w.r.t. host, but we must ensure
+               the source device's kernels (on any stream) have finished first. */
             ds4_gpu_synchronize();
+            ok = ds4_gpu_pp_p2p_copy_ptr(gp + 1, gp,
+                ds4_gpu_tensor_contents(pp[gp + 1].g.cur_hc),
+                ds4_gpu_tensor_contents(gg->cur_hc),
+                ds4_gpu_tensor_bytes(gg->cur_hc)) != 0;
         }
     }
 
     if (ok && need_logits) {
         int last = ngpu - 1;
-        ds4_gpu_pp_p2p_copy_ptr(0, last,
-            ds4_gpu_tensor_contents(g0->cur_hc),
-            ds4_gpu_tensor_contents(pp[last].g.after_ffn_hc),
-            ds4_gpu_tensor_bytes(pp[last].g.after_ffn_hc));
-        /* Ensure P2P copy to GPU0 completes before GPU0 reads g0->cur_hc in output_head */
+        ds4_gpu_pp_set_device(last);
         ds4_gpu_synchronize();
+        ok = ds4_gpu_pp_p2p_copy_ptr(0, last,
+            ds4_gpu_tensor_contents(g0->cur_hc),
+            ds4_gpu_tensor_contents(pp[last].g.cur_hc),
+            ds4_gpu_tensor_bytes(pp[last].g.cur_hc)) != 0;
         ds4_gpu_pp_set_device(0);
         ok = metal_graph_encode_output_head(g0, model, weights, weights->output->dim[1]);
     }
+    ds4_gpu_pp_set_device(0);
     return ok;
 }
 
@@ -14052,7 +14047,9 @@ static bool metal_graph_eval_token_raw_swa(
     const double t_done = (profile || throttle) ? now_sec() : 0.0;
 
     if (ok && logits) {
-        ok = ds4_gpu_tensor_read(g->logits, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+        /* PP mode writes logits into g_pp_graphs[0].g.logits, not g->logits */
+        ds4_gpu_tensor *logits_src = (pp_mode && g_pp_graphs) ? g_pp_graphs[0].g.logits : g->logits;
+        ok = ds4_gpu_tensor_read(logits_src, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
     }
     const double t_read = (profile || throttle) ? now_sec() : 0.0;
 

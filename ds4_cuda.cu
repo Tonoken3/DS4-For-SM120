@@ -169,6 +169,7 @@ extern "C" void ds4_gpu_pp_deactivate_decode_params_all(int ngpu) {
 }
 
 extern "C" void ds4_debug_decode_symbol_token(const char *where, uint32_t host_token, uint32_t n_vocab) {
+    if (getenv("DS4_CUDA_PP_DEBUG") == NULL) return;
     int dev = -1;
     (void)cudaGetDevice(&dev);
     int active = -1;
@@ -437,8 +438,9 @@ static uint64_t g_model_load_progress_next;
 static double g_model_load_progress_last;
 static int g_model_load_progress_started;
 static int g_model_load_progress_tty;
-static void *g_cuda_tmp;
-static uint64_t g_cuda_tmp_bytes;
+#define DS4_CUDA_MAX_DEVICES 16
+static void *g_cuda_tmp_dev[DS4_CUDA_MAX_DEVICES];
+static uint64_t g_cuda_tmp_bytes_dev[DS4_CUDA_MAX_DEVICES];
 static void *g_model_stage_raw[4];
 static void *g_model_stage[4];
 static cudaEvent_t g_model_stage_event[4];
@@ -504,23 +506,60 @@ __global__ static void dequant_q8_0_to_f32_kernel(
 
 static void *cuda_tmp_alloc(uint64_t bytes, const char *what) {
     if (bytes == 0) return NULL;
-    if (g_cuda_tmp_bytes >= bytes) return g_cuda_tmp;
-    if (g_cuda_tmp) {
-        (void)cudaFree(g_cuda_tmp);
-        g_cuda_tmp = NULL;
-        g_cuda_tmp_bytes = 0;
-    }
-    void *ptr = NULL;
-    cudaError_t err = cudaMalloc(&ptr, (size_t)bytes);
-    if (err != cudaSuccess) {
-        fprintf(stderr, "ds4: CUDA temp alloc failed for %s (%.2f MiB): %s\n",
-                what ? what : "scratch", (double)bytes / 1048576.0, cudaGetErrorString(err));
+
+    int dev = -1;
+    cudaError_t ge = cudaGetDevice(&dev);
+    if (ge != cudaSuccess || dev < 0 || dev >= DS4_CUDA_MAX_DEVICES) {
+        fprintf(stderr, "ds4: CUDA temp alloc failed for %s: invalid current device\n",
+                what ? what : "scratch");
         (void)cudaGetLastError();
         return NULL;
     }
-    g_cuda_tmp = ptr;
-    g_cuda_tmp_bytes = bytes;
-    return g_cuda_tmp;
+
+    if (g_cuda_tmp_dev[dev] && g_cuda_tmp_bytes_dev[dev] >= bytes) {
+        if (getenv("DS4_CUDA_TMP_CHECK") != NULL) {
+            cudaPointerAttributes a;
+            cudaError_t ae = cudaPointerGetAttributes(&a, g_cuda_tmp_dev[dev]);
+            if (ae == cudaSuccess) {
+                fprintf(stderr, "ds4: CUDA tmp check reuse dev=%d ptr=%p attr.device=%d type=%d\n",
+                        dev, g_cuda_tmp_dev[dev], a.device, (int)a.type);
+            }
+        }
+        return g_cuda_tmp_dev[dev];
+    }
+
+    if (g_cuda_tmp_dev[dev]) {
+        (void)cudaFree(g_cuda_tmp_dev[dev]);
+        g_cuda_tmp_dev[dev] = NULL;
+        g_cuda_tmp_bytes_dev[dev] = 0;
+    }
+
+    void *ptr = NULL;
+    cudaError_t err = cudaMalloc(&ptr, (size_t)bytes);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "ds4: CUDA temp alloc failed for %s dev=%d (%.2f MiB): %s\n",
+                what ? what : "scratch", dev, (double)bytes / 1048576.0, cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return NULL;
+    }
+
+    g_cuda_tmp_dev[dev] = ptr;
+    g_cuda_tmp_bytes_dev[dev] = bytes;
+
+    if (getenv("DS4_CUDA_TMP_CHECK") != NULL) {
+        cudaPointerAttributes a;
+        cudaError_t ae = cudaPointerGetAttributes(&a, ptr);
+        if (ae == cudaSuccess) {
+            fprintf(stderr, "ds4: CUDA tmp check alloc dev=%d ptr=%p attr.device=%d type=%d what=%s\n",
+                    dev, ptr, a.device, (int)a.type, what ? what : "?");
+        } else {
+            fprintf(stderr, "ds4: CUDA tmp check failed dev=%d ptr=%p: %s\n",
+                    dev, ptr, cudaGetErrorString(ae));
+            (void)cudaGetLastError();
+        }
+    }
+
+    return ptr;
 }
 
 static int cuda_attention_score_buffer_fits(uint32_t n_comp) {
@@ -2041,10 +2080,20 @@ extern "C" void ds4_gpu_cleanup(void) {
     g_q8_f32_ranges.clear();
     g_q8_f32_by_offset.clear();
     g_q8_f32_bytes = 0;
-    if (g_cuda_tmp) {
-        (void)cudaFree(g_cuda_tmp);
-        g_cuda_tmp = NULL;
-        g_cuda_tmp_bytes = 0;
+    {
+        int saved = 0;
+        (void)cudaGetDevice(&saved);
+        for (int d = 0; d < DS4_CUDA_MAX_DEVICES; ++d) {
+            if (!g_cuda_tmp_dev[d]) continue;
+            if (cudaSetDevice(d) == cudaSuccess) {
+                (void)cudaFree(g_cuda_tmp_dev[d]);
+            } else {
+                (void)cudaGetLastError();
+            }
+            g_cuda_tmp_dev[d] = NULL;
+            g_cuda_tmp_bytes_dev[d] = 0;
+        }
+        (void)cudaSetDevice(saved);
     }
     for (size_t i = 0; i < 4; i++) {
         if (g_model_stage_event[i]) {
@@ -6465,25 +6514,27 @@ extern "C" int ds4_gpu_embed_token_hc_tensor(ds4_gpu_tensor *out_hc, const void 
     if (token >= n_vocab) token = 0;
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "token_embd");
     if (!wptr) return 0;
-    ds4_debug_ptr_attr_raw("embed token wptr", wptr);
-    ds4_debug_ptr_attr_raw("embed token out_hc", out_hc->ptr);
-    /* Read actual row accessed by kernel (token * n_embd) */
-    const uint64_t tok = token < n_vocab ? token : 0;
-    const uint64_t row_bytes = tok * (uint64_t)n_embd * sizeof(uint16_t);
-    __half v0, v_last;
-    cudaError_t ce = cudaMemcpy(&v0, wptr + row_bytes, sizeof(v0), cudaMemcpyDeviceToHost);
-    cudaError_t ce_last = cudaMemcpy(&v_last,
-            wptr + row_bytes + (uint64_t)(n_embd - 1) * sizeof(uint16_t),
-            sizeof(v_last), cudaMemcpyDeviceToHost);
-    fprintf(stderr,
-            "ds4: embed row read token=%u row_off=%llu first=%s/%g last=%s/%g\n",
-            token,
-            (unsigned long long)row_bytes,
-            cudaGetErrorString(ce), ce == cudaSuccess ? __half2float(v0) : 0.0f,
-            cudaGetErrorString(ce_last), ce_last == cudaSuccess ? __half2float(v_last) : 0.0f);
-    if (ce != cudaSuccess || ce_last != cudaSuccess) {
-        (void)cudaGetLastError();
-        return 0;
+    if (getenv("DS4_CUDA_PP_EMBED_DEBUG") != NULL) {
+        ds4_debug_ptr_attr_raw("embed token wptr", wptr);
+        ds4_debug_ptr_attr_raw("embed token out_hc", out_hc->ptr);
+        /* Read actual row accessed by kernel (token * n_embd) */
+        const uint64_t tok = token < n_vocab ? token : 0;
+        const uint64_t row_bytes = tok * (uint64_t)n_embd * sizeof(uint16_t);
+        __half v0, v_last;
+        cudaError_t ce = cudaMemcpy(&v0, wptr + row_bytes, sizeof(v0), cudaMemcpyDeviceToHost);
+        cudaError_t ce_last = cudaMemcpy(&v_last,
+                wptr + row_bytes + (uint64_t)(n_embd - 1) * sizeof(uint16_t),
+                sizeof(v_last), cudaMemcpyDeviceToHost);
+        fprintf(stderr,
+                "ds4: embed row read token=%u row_off=%llu first=%s/%g last=%s/%g\n",
+                token,
+                (unsigned long long)row_bytes,
+                cudaGetErrorString(ce), ce == cudaSuccess ? __half2float(v0) : 0.0f,
+                cudaGetErrorString(ce_last), ce_last == cudaSuccess ? __half2float(v_last) : 0.0f);
+        if (ce != cudaSuccess || ce_last != cudaSuccess) {
+            (void)cudaGetLastError();
+            return 0;
+        }
     }
     if (getenv("DS4_CUDA_PP_CPU_EMBED") != NULL) {
         return ds4_gpu_embed_token_hc_cpu_fallback(

@@ -13716,8 +13716,14 @@ static bool metal_graph_eval_token_raw_swa(
     } else {
         const int subgraphs_ready =
             graph_capture_mode && ds4_gpu_decode_subgraphs_ready();
+        const int replay_enabled = getenv("DS4_CUDA_SUBGRAPH_REPLAY") != NULL;
 
-        if (ok && graph_capture_mode && !subgraphs_ready && pos > 10) {
+        if (replay_enabled && subgraphs_ready) {
+            /* Phase A: sub-graph replay (opt-in, DS4_CUDA_SUBGRAPH_REPLAY=1) */
+            for (uint32_t il = 0; il < DS4_N_LAYER && ok; il++)
+                ok = ok && ds4_gpu_decode_subgraph_launch((int)il);
+            if (profile) t_encoded = now_sec();
+        } else if (ok && graph_capture_mode && !subgraphs_ready && pos > 10) {
             /* Capture is kept as a build-up step, but captured work is not the
              * correctness path until kernel node parameters are updated per
              * token. Run normal encode below for the current token too. */

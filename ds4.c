@@ -13657,6 +13657,8 @@ static bool metal_graph_eval_token_raw_swa(
     const bool throttle = graph_power_throttle_enabled(g);
     const double t0 = (profile || throttle) ? now_sec() : 0.0;
     const bool graph_mode = getenv("DS4_CUDA_DECODE_GRAPH") != NULL;
+    const bool graph_capture_mode = graph_mode && g->cuda_params_host &&
+                                    ds4_gpu_decode_graph_can_capture() != 0;
 
     /* Phase 2: fill and push decode params for graph replay */
     if (graph_mode && g->cuda_params_host) {
@@ -13678,7 +13680,7 @@ static bool metal_graph_eval_token_raw_swa(
     bool ok = ds4_gpu_begin_commands() != 0;
     double t_encoded = (profile || throttle) ? now_sec() : 0.0;
 
-    if (graph_mode && ds4_gpu_decode_graph_captured()) {
+    if (graph_capture_mode && ds4_gpu_decode_graph_captured()) {
         double r0 = profile ? now_sec() : 0.0;
         ok = ok && ds4_gpu_decode_params_push(g->cuda_params_host);
         double r1 = profile ? now_sec() : 0.0;
@@ -13687,7 +13689,7 @@ static bool metal_graph_eval_token_raw_swa(
         if (profile) fprintf(stderr, "ds4: graph replay push=%.3f launch=%.3f ms\n",
                              (r1 - r0) * 1000.0, (r2 - r1) * 1000.0);
         if (profile) t_encoded = now_sec();
-    } else if (graph_mode && g->cuda_params_host && pos > 10) {
+    } else if (graph_capture_mode && pos > 10) {
         /* Capture the decode graph */
         fprintf(stderr, "ds4: graph capture path pos=%u\n", pos);
         ok = ok && ds4_gpu_decode_graph_capture();

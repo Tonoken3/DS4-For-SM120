@@ -862,6 +862,7 @@ int ds4_gpu_decode_params_push(const ds4_cuda_decode_params *host);
 int ds4_gpu_decode_params_deactivate(void);
 
 /* Phase 3: CUDA Graph capture/replay */
+int ds4_gpu_decode_graph_can_capture(void);      /* 1 if current weight policy is capture-safe */
 int ds4_gpu_decode_graph_capture(void);          /* begin capture */
 int ds4_gpu_decode_graph_capture_end(void);       /* end capture + instantiate */
 int ds4_gpu_decode_graph_launch(void);            /* replay captured graph */

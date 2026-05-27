@@ -105,6 +105,10 @@ static cudaStream_t ds4_decode_stream(void) {
 static cudaGraph_t g_cuda_decode_graph;
 static cudaGraphExec_t g_cuda_decode_graph_exec;
 static int g_cuda_decode_graph_captured;
+static int g_decode_graph_capture_disabled_notice_printed;
+
+static int cuda_model_direct_host_access_allowed(void);
+static int cuda_moe_temp_weights_enabled(void);
 
 /* Phase 2: device-resident decode params for CUDA Graph replay.
  * When ds4_cuda_params_active != 0, kernels read token/pos/etc. from
@@ -206,6 +210,22 @@ extern "C" int ds4_gpu_decode_graph_captured(void) {
     return g_cuda_decode_graph_captured && g_cuda_decode_graph_exec != NULL;
 }
 
+extern "C" int ds4_gpu_decode_graph_can_capture(void) {
+    const int temp_moe_weights =
+        cuda_moe_temp_weights_enabled() &&
+        !g_model_device_owned &&
+        !g_model_registered &&
+        !cuda_model_direct_host_access_allowed();
+    if (!temp_moe_weights) return 1;
+    if (!g_decode_graph_capture_disabled_notice_printed) {
+        fprintf(stderr,
+                "ds4: CUDA graph capture disabled: MoE weights are streamed "
+                "through transient/scratch buffers and are not replay-safe yet\n");
+        g_decode_graph_capture_disabled_notice_printed = 1;
+    }
+    return 0;
+}
+
 /* Phase 2: Decode params — pinned host + device copies for dynamic update */
 extern "C" int ds4_gpu_decode_params_alloc(ds4_cuda_decode_params **host,
                                             void                    **device,
@@ -300,8 +320,6 @@ static int g_model_load_progress_started;
 static int g_model_load_progress_tty;
 static void *g_cuda_tmp;
 static uint64_t g_cuda_tmp_bytes;
-static void *g_moe_staging_host;     /* pinned host buffer for MoE weight copies */
-static uint64_t g_moe_staging_bytes;
 static void *g_model_stage_raw[4];
 static void *g_model_stage[4];
 static cudaEvent_t g_model_stage_event[4];
@@ -321,6 +339,8 @@ static uint64_t g_moe_scratch_down_bytes;
 
 static int cuda_ok(cudaError_t err, const char *what);
 static int cuda_decode_graph_enabled(void);
+static int cuda_model_direct_host_access_allowed(void);
+static int cuda_moe_temp_weights_enabled(void);
 static const char *cuda_model_range_ptr_from_fd(
         const void *model_map,
         uint64_t offset,
@@ -519,31 +539,19 @@ static const char *cuda_model_temp_range_alloc(
         else if (what && strstr(what, "moe_down") && g_moe_scratch_down && bytes <= g_moe_scratch_down_bytes) slot = 2;
         if (slot >= 0) {
             char *scratch = slot == 0 ? g_moe_scratch_gate : slot == 1 ? g_moe_scratch_up : g_moe_scratch_down;
-            /* Copy from model mapping (unpinned) to pinned staging buffer via CPU,
-             * then launch async H2D from pinned to device. This ensures the async
-             * memcpy is truly non-blocking and compatible with CUDA Graph capture. */
+            /* Use the mmap'd model bytes as the async copy source. The source is
+             * stable across queued copies; a shared pinned staging buffer is not,
+             * because the host can overwrite it before the previous H2D DMA has
+             * consumed it. CUDA Graph capture is disabled for this weight policy
+             * until MoE weights are device-resident or gathered inside the graph. */
             const char *src = (const char *)model_map + offset;
-            if (g_moe_staging_host && bytes <= g_moe_staging_bytes) {
-                char *staging = (char *)g_moe_staging_host;
-                memcpy(staging, src, (size_t)bytes);
-                cudaError_t err = cudaMemcpyAsync(scratch, staging, (size_t)bytes,
-                                                  cudaMemcpyHostToDevice, ds4_decode_stream());
-                if (err != cudaSuccess) {
-                    fprintf(stderr, "ds4: CUDA moe staged copy failed for %s: %s\n",
-                            what ? what : "?", cudaGetErrorString(err));
-                    (void)cudaGetLastError();
-                    return NULL;
-                }
-            } else {
-                /* Fallback: direct unpinned->device (may block) */
-                cudaError_t err = cudaMemcpyAsync(scratch, src, (size_t)bytes,
-                                                  cudaMemcpyHostToDevice, ds4_decode_stream());
-                if (err != cudaSuccess) {
-                    fprintf(stderr, "ds4: CUDA moe direct copy failed for %s: %s\n",
-                            what ? what : "?", cudaGetErrorString(err));
-                    (void)cudaGetLastError();
-                    return NULL;
-                }
+            cudaError_t err = cudaMemcpyAsync(scratch, src, (size_t)bytes,
+                                              cudaMemcpyHostToDevice, ds4_decode_stream());
+            if (err != cudaSuccess) {
+                fprintf(stderr, "ds4: CUDA moe scratch copy failed for %s: %s\n",
+                        what ? what : "?", cudaGetErrorString(err));
+                (void)cudaGetLastError();
+                return NULL;
             }
             tmp->device_ptr = scratch;
             tmp->bytes = bytes;
@@ -679,7 +687,21 @@ static uint64_t cuda_parse_mib_env(const char *name, int *present) {
 static uint64_t cuda_q8_f16_cache_limit_bytes(void) {
     int present = 0;
     const uint64_t limit = cuda_parse_mib_env("DS4_CUDA_Q8_F16_CACHE_MB", &present);
-    return present ? limit : UINT64_MAX;
+    if (present) return limit;
+
+    size_t free_bytes = 0;
+    size_t total_bytes = 0;
+    cudaError_t err = cudaMemGetInfo(&free_bytes, &total_bytes);
+    if (err == cudaSuccess) {
+        (void)free_bytes;
+        if ((uint64_t)total_bytes <= 24ull * 1024ull * 1024ull * 1024ull &&
+            cuda_moe_temp_weights_enabled()) {
+            return 0;
+        }
+    } else {
+        (void)cudaGetLastError();
+    }
+    return UINT64_MAX;
 }
 
 static uint64_t cuda_q8_f16_cache_reserve_bytes(uint64_t total_bytes) {
@@ -1622,6 +1644,8 @@ extern "C" int ds4_gpu_init(void) {
 
 void ds4_gpu_init_moe_scratch(uint64_t gate_bytes, uint64_t up_bytes, uint64_t down_bytes) {
     if (g_moe_scratch_inited) return;
+    const char *scratch_env = getenv("DS4_CUDA_MOE_PERSISTENT_SCRATCH");
+    if (!scratch_env || !scratch_env[0] || scratch_env[0] == '0') return;
     /* Limit to available VRAM: skip if total > 2 GiB */
     if (gate_bytes + up_bytes + down_bytes > 2ull * 1073741824ull) {
         fprintf(stderr, "ds4: MoE scratch too large (%.2f GiB), skipping\n",
@@ -1639,20 +1663,6 @@ void ds4_gpu_init_moe_scratch(uint64_t gate_bytes, uint64_t up_bytes, uint64_t d
     g_moe_scratch_up_bytes = up_bytes;
     g_moe_scratch_down_bytes = down_bytes;
     g_moe_scratch_inited = 1;
-    /* Allocate pinned host staging buffer for async H2D copies */
-    uint64_t staging = gate_bytes + up_bytes + down_bytes;
-    if (staging > g_moe_staging_bytes) {
-        if (g_moe_staging_host) cudaFreeHost(g_moe_staging_host);
-        g_moe_staging_host = NULL;
-        g_moe_staging_bytes = 0;
-        ce = cudaMallocHost(&g_moe_staging_host, (size_t)staging);
-        if (ce == cudaSuccess) {
-            g_moe_staging_bytes = staging;
-        } else {
-            fprintf(stderr, "ds4: MoE staging alloc failed, falling back to synchronous copies\n");
-            (void)cudaGetLastError();
-        }
-    }
     fprintf(stderr, "ds4: MoE persistent scratch allocated (gate=%.2f up=%.2f down=%.2f MiB)\n",
             (double)gate_bytes / 1048576.0, (double)up_bytes / 1048576.0, (double)down_bytes / 1048576.0);
 }
@@ -1742,12 +1752,11 @@ extern "C" void ds4_gpu_cleanup(void) {
     if (g_moe_scratch_gate) { (void)cudaFree(g_moe_scratch_gate); g_moe_scratch_gate = NULL; }
     if (g_moe_scratch_up)   { (void)cudaFree(g_moe_scratch_up);   g_moe_scratch_up = NULL; }
     if (g_moe_scratch_down) { (void)cudaFree(g_moe_scratch_down); g_moe_scratch_down = NULL; }
-    if (g_moe_staging_host) { (void)cudaFreeHost(g_moe_staging_host); g_moe_staging_host = NULL; }
-    g_moe_staging_bytes = 0;
     g_moe_scratch_gate_bytes = 0;
     g_moe_scratch_up_bytes = 0;
     g_moe_scratch_down_bytes = 0;
     g_moe_scratch_inited = 0;
+    g_decode_graph_capture_disabled_notice_printed = 0;
 }
 
 __global__ static void fill_f32_kernel(float *x, uint64_t n, float v);

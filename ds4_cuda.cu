@@ -325,6 +325,7 @@ static void *g_model_stage[4];
 static cudaEvent_t g_model_stage_event[4];
 static uint64_t g_model_stage_bytes;
 static int g_moe_temp_weights_notice_printed;
+static int g_moe_compact_notice_printed;
 static int g_moe_scratch_inited;
 
 /* Persistent MoE scratch: pre-allocated buffer for one layer's full expert
@@ -336,6 +337,15 @@ static char *g_moe_scratch_down;
 static uint64_t g_moe_scratch_gate_bytes;
 static uint64_t g_moe_scratch_up_bytes;
 static uint64_t g_moe_scratch_down_bytes;
+
+/* Selected-expert compact scratch: 6 experts' weights (gate+up+down).
+ * Allocated once, reused per layer. Replaces the full 256-expert transfer
+ * with a 6-expert compact copy, reducing H2D volume from 1.7GB to ~42MB. */
+static char *g_moe_compact_gate;
+static char *g_moe_compact_up;
+static char *g_moe_compact_down;
+static int32_t *g_moe_compact_selected_dev; /* device: remapped indices 0-5 */
+static uint64_t g_moe_compact_per_expert;   /* max(gate_expert_bytes, down_expert_bytes) */
 
 static int cuda_ok(cudaError_t err, const char *what);
 static int cuda_decode_graph_enabled(void);
@@ -1756,7 +1766,11 @@ extern "C" void ds4_gpu_cleanup(void) {
     g_moe_scratch_up_bytes = 0;
     g_moe_scratch_down_bytes = 0;
     g_moe_scratch_inited = 0;
-    g_decode_graph_capture_disabled_notice_printed = 0;
+    if (g_moe_compact_gate) { (void)cudaFree(g_moe_compact_gate); g_moe_compact_gate = NULL; }
+    if (g_moe_compact_up)   { (void)cudaFree(g_moe_compact_up);   g_moe_compact_up = NULL; }
+    if (g_moe_compact_down) { (void)cudaFree(g_moe_compact_down); g_moe_compact_down = NULL; }
+    if (g_moe_compact_selected_dev) { (void)cudaFree(g_moe_compact_selected_dev); g_moe_compact_selected_dev = NULL; }
+    g_moe_compact_per_expert = 0;
 }
 
 __global__ static void fill_f32_kernel(float *x, uint64_t n, float v);
@@ -10423,36 +10437,121 @@ static int routed_moe_launch(
         !g_model_device_owned &&
         !g_model_registered &&
         !cuda_model_direct_host_access_allowed();
-    if (use_temp_weights) {
-        if (!g_moe_temp_weights_notice_printed ||
-            getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE") != NULL) {
-            fprintf(stderr,
-                    "ds4: CUDA MoE using transient per-layer weights "
-                    "(gate %.2f MiB, up %.2f MiB, down %.2f MiB)\n",
-                    (double)gate_bytes / 1048576.0,
-                    (double)gate_bytes / 1048576.0,
-                    (double)down_bytes / 1048576.0);
-            g_moe_temp_weights_notice_printed = 1;
+
+    /* Selected-expert compact copy: for decode (1 token, 6 experts), copy only
+     * the 6 selected experts into a pre-allocated scratch instead of all 256.
+     * This replaces 1.7 GB/layer H2D with ~42 MB/layer. */
+    const char *gate_w = NULL;
+    const char *up_w = NULL;
+    const char *down_w = NULL;
+    int use_compact = 0;
+    int32_t compact_remap[6];
+    uint64_t compact_exp_bytes =
+        gate_expert_bytes > down_expert_bytes ? gate_expert_bytes : down_expert_bytes;
+
+    if (use_temp_weights && n_tokens == 1 && n_expert <= 6) {
+        /* Allocate compact scratch on first use */
+        const uint64_t need = (uint64_t)n_expert * compact_exp_bytes;
+        if ((!g_moe_compact_gate || g_moe_compact_per_expert < compact_exp_bytes) &&
+            n_expert > 0) {
+            if (g_moe_compact_gate) cudaFree(g_moe_compact_gate);
+            if (g_moe_compact_up)   cudaFree(g_moe_compact_up);
+            if (g_moe_compact_down) cudaFree(g_moe_compact_down);
+            if (g_moe_compact_selected_dev) cudaFree(g_moe_compact_selected_dev);
+            g_moe_compact_gate = g_moe_compact_up = g_moe_compact_down = NULL;
+            g_moe_compact_selected_dev = NULL;
+            g_moe_compact_per_expert = 0;
+            uint64_t max_per = gate_expert_bytes > down_expert_bytes ? gate_expert_bytes : down_expert_bytes;
+            uint64_t total = (uint64_t)n_expert * max_per;
+            if (cudaMalloc(&g_moe_compact_gate, (size_t)total) == cudaSuccess &&
+                cudaMalloc(&g_moe_compact_up,   (size_t)total) == cudaSuccess &&
+                cudaMalloc(&g_moe_compact_down, (size_t)total) == cudaSuccess &&
+                cudaMalloc(&g_moe_compact_selected_dev, (size_t)n_expert * 4) == cudaSuccess) {
+                g_moe_compact_per_expert = max_per;
+            } else {
+                cudaFree(g_moe_compact_gate); g_moe_compact_gate = NULL;
+                cudaFree(g_moe_compact_up);   g_moe_compact_up = NULL;
+                cudaFree(g_moe_compact_down); g_moe_compact_down = NULL;
+                cudaFree(g_moe_compact_selected_dev); g_moe_compact_selected_dev = NULL;
+                (void)cudaGetLastError();
+            }
+        }
+        if (g_moe_compact_gate && g_moe_compact_per_expert >= compact_exp_bytes) {
+            /* Read selected indices from device (6 int32 = 24 bytes, fast) */
+            int32_t host_selected[6];
+            cudaError_t ce = cudaMemcpy(host_selected, selected->ptr,
+                                        (size_t)n_expert * 4, cudaMemcpyDeviceToHost);
+            if (ce == cudaSuccess) {
+                use_compact = 1;
+                /* Copy each selected expert's weights to compact scratch */
+                for (uint32_t ei = 0; ei < n_expert; ei++) {
+                    int ge = host_selected[ei];
+                    if (ge < 0) ge = 0;
+                    if ((uint32_t)ge >= n_total_expert) ge = 0;
+                    uint32_t uge = (uint32_t)ge;
+                    compact_remap[ei] = (int32_t)ei; /* local index */
+                    cudaMemcpyAsync(g_moe_compact_gate + (uint64_t)ei * gate_expert_bytes,
+                                    (const char*)model_map + gate_offset + (uint64_t)uge * gate_expert_bytes,
+                                    gate_expert_bytes, cudaMemcpyHostToDevice, ds4_decode_stream());
+                    cudaMemcpyAsync(g_moe_compact_up   + (uint64_t)ei * gate_expert_bytes,
+                                    (const char*)model_map + up_offset   + (uint64_t)uge * gate_expert_bytes,
+                                    gate_expert_bytes, cudaMemcpyHostToDevice, ds4_decode_stream());
+                    cudaMemcpyAsync(g_moe_compact_down + (uint64_t)ei * down_expert_bytes,
+                                    (const char*)model_map + down_offset + (uint64_t)uge * down_expert_bytes,
+                                    down_expert_bytes, cudaMemcpyHostToDevice, ds4_decode_stream());
+                }
+                cudaMemcpyAsync(g_moe_compact_selected_dev, compact_remap,
+                                (size_t)n_expert * 4, cudaMemcpyHostToDevice, ds4_decode_stream());
+                gate_w = g_moe_compact_gate;
+                up_w   = g_moe_compact_up;
+                down_w = g_moe_compact_down;
+                if (!g_moe_compact_notice_printed) {
+                    fprintf(stderr, "ds4: CUDA MoE compact selected-expert copy (%u experts, %.2f MiB/layer)\n",
+                            n_expert, (double)(n_expert * (gate_expert_bytes * 2 + down_expert_bytes)) / 1048576.0);
+                    g_moe_compact_notice_printed = 1;
+                }
+            } else {
+                (void)cudaGetLastError();
+            }
         }
     }
-    const char *gate_w = use_temp_weights
-        ? cuda_model_temp_range_alloc(model_map, model_size, gate_offset,
-                                      gate_bytes, "moe_gate", &gate_tmp)
-        : cuda_model_range_ptr(model_map, gate_offset, gate_bytes, "moe_gate");
-    const char *up_w = use_temp_weights
-        ? cuda_model_temp_range_alloc(model_map, model_size, up_offset,
-                                      gate_bytes, "moe_up", &up_tmp)
-        : cuda_model_range_ptr(model_map, up_offset, gate_bytes, "moe_up");
-    const char *down_w = use_temp_weights
-        ? cuda_model_temp_range_alloc(model_map, model_size, down_offset,
-                                      down_bytes, "moe_down", &down_tmp)
-        : cuda_model_range_ptr(model_map, down_offset, down_bytes, "moe_down");
+
+    if (!use_compact) {
+        if (use_temp_weights) {
+            if (!g_moe_temp_weights_notice_printed ||
+                getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE") != NULL) {
+                fprintf(stderr,
+                        "ds4: CUDA MoE using transient per-layer weights "
+                        "(gate %.2f MiB, up %.2f MiB, down %.2f MiB)\n",
+                        (double)gate_bytes / 1048576.0,
+                        (double)gate_bytes / 1048576.0,
+                        (double)down_bytes / 1048576.0);
+                g_moe_temp_weights_notice_printed = 1;
+            }
+        }
+        gate_w = use_temp_weights
+            ? cuda_model_temp_range_alloc(model_map, model_size, gate_offset,
+                                          gate_bytes, "moe_gate", &gate_tmp)
+            : cuda_model_range_ptr(model_map, gate_offset, gate_bytes, "moe_gate");
+        up_w = use_temp_weights
+            ? cuda_model_temp_range_alloc(model_map, model_size, up_offset,
+                                          gate_bytes, "moe_up", &up_tmp)
+            : cuda_model_range_ptr(model_map, up_offset, gate_bytes, "moe_up");
+        down_w = use_temp_weights
+            ? cuda_model_temp_range_alloc(model_map, model_size, down_offset,
+                                          down_bytes, "moe_down", &down_tmp)
+            : cuda_model_range_ptr(model_map, down_offset, down_bytes, "moe_down");
+    }
+
     if (!gate_w || !up_w || !down_w) {
         (void)cuda_moe_temp_weights_release(&gate_tmp, &up_tmp, &down_tmp);
         return 0;
     }
 
     int ok = 1;
+    const int32_t *selected_ptr = use_compact
+        ? g_moe_compact_selected_dev
+        : (const int32_t *)selected->ptr;
     const uint32_t xq_blocks = expert_in_dim / CUDA_QK_K;
     const uint32_t midq_blocks = expert_mid_dim / CUDA_QK_K;
     const uint64_t xq_count = (uint64_t)n_tokens * xq_blocks;
@@ -10577,7 +10676,7 @@ static int routed_moe_launch(
                 if (ok) {
                     moe_count_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256, 0, ds4_decode_stream()>>>(
                         counts,
-                        (const int32_t *)selected->ptr,
+                        selected_ptr,
                         pair_count);
                     ok = cuda_ok(cudaGetLastError(), "routed_moe sorted count launch");
                 }
@@ -10589,7 +10688,7 @@ static int routed_moe_launch(
                     moe_scatter_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256, 0, ds4_decode_stream()>>>(
                         sorted_pairs,
                         cursors,
-                        (const int32_t *)selected->ptr,
+                        selected_ptr,
                         pair_count);
                     ok = cuda_ok(cudaGetLastError(), "routed_moe sorted scatter launch");
                 }
@@ -10668,7 +10767,7 @@ static int routed_moe_launch(
                     up_w,
                     xq,
                     sorted_pairs,
-                    (const int32_t *)selected->ptr,
+                    selected_ptr,
                     (const float *)weights->ptr,
                     gate_expert_bytes,
                     gate_row_bytes,
@@ -10686,7 +10785,7 @@ static int routed_moe_launch(
                     up_w,
                     xq,
                     sorted_pairs,
-                    (const int32_t *)selected->ptr,
+                    selected_ptr,
                     (const float *)weights->ptr,
                     gate_expert_bytes,
                     gate_row_bytes,
@@ -10704,7 +10803,7 @@ static int routed_moe_launch(
                         gate_w,
                         up_w,
                         xq,
-                        (const int32_t *)selected->ptr,
+                        selected_ptr,
                         (const float *)weights->ptr,
                         gate_expert_bytes,
                         gate_row_bytes,
@@ -10721,7 +10820,7 @@ static int routed_moe_launch(
                         gate_w,
                         up_w,
                         xq,
-                        (const int32_t *)selected->ptr,
+                        selected_ptr,
                         (const float *)weights->ptr,
                         gate_expert_bytes,
                         gate_row_bytes,
@@ -10738,7 +10837,7 @@ static int routed_moe_launch(
                         gate_w,
                         up_w,
                         xq,
-                        (const int32_t *)selected->ptr,
+                        selected_ptr,
                         (const float *)weights->ptr,
                         gate_expert_bytes,
                         gate_row_bytes,
@@ -10776,7 +10875,7 @@ static int routed_moe_launch(
                         (float *)out->ptr,
                         down_w,
                         midq,
-                        (const int32_t *)selected->ptr,
+                        selected_ptr,
                         down_expert_bytes,
                         down_row_bytes,
                         midq_blocks,
@@ -10786,7 +10885,7 @@ static int routed_moe_launch(
                         (float *)out->ptr,
                         down_w,
                         midq,
-                        (const int32_t *)selected->ptr,
+                        selected_ptr,
                         down_expert_bytes,
                         down_row_bytes,
                         midq_blocks,
@@ -10853,7 +10952,7 @@ static int routed_moe_launch(
                     down_w,
                     midq,
                     sorted_pairs,
-                    (const int32_t *)selected->ptr,
+                    selected_ptr,
                     down_expert_bytes,
                     down_row_bytes,
                     midq_blocks,
@@ -10866,7 +10965,7 @@ static int routed_moe_launch(
                     down_w,
                     midq,
                     sorted_pairs,
-                    (const int32_t *)selected->ptr,
+                    selected_ptr,
                     down_expert_bytes,
                     down_row_bytes,
                     midq_blocks,
@@ -10877,7 +10976,7 @@ static int routed_moe_launch(
                     (float *)down->ptr,
                     down_w,
                     midq,
-                    (const int32_t *)selected->ptr,
+                    selected_ptr,
                     down_expert_bytes,
                     down_row_bytes,
                     midq_blocks,
@@ -10922,7 +11021,7 @@ static int routed_moe_launch(
             gate_w,
             up_w,
             (const float *)x->ptr,
-            (const int32_t *)selected->ptr,
+            selected_ptr,
             (const float *)weights->ptr,
             gate_expert_bytes,
             gate_row_bytes,
@@ -10938,7 +11037,7 @@ static int routed_moe_launch(
             (float *)down->ptr,
             down_w,
             (const float *)mid->ptr,
-            (const int32_t *)selected->ptr,
+            selected_ptr,
             down_expert_bytes,
             down_row_bytes,
             expert_mid_dim,

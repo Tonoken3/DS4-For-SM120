@@ -194,7 +194,15 @@ extern "C" int ds4_gpu_decode_graph_capture_end(void) {
     return 1;
 }
 extern "C" int ds4_gpu_decode_graph_capture_end_store(int part, int layer) {
-    if (layer < 0 || layer >= 43 || !g_cuda_decode_stream_created) return 0;
+    if (layer < 0) {
+        /* Abort capture on failure: end capture and discard the graph */
+        cudaGraph_t graph = NULL;
+        cudaError_t ce = cudaStreamEndCapture(g_cuda_decode_stream, &graph);
+        if (graph) (void)cudaGraphDestroy(graph);
+        if (ce != cudaSuccess) (void)cudaGetLastError();
+        return 0;
+    }
+    if (layer >= 43 || !g_cuda_decode_stream_created) return 0;
     cudaGraph_t graph = NULL;
     cudaError_t ce = cudaStreamEndCapture(g_cuda_decode_stream, &graph);
     if (ce != cudaSuccess || !graph) {

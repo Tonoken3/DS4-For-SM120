@@ -13754,14 +13754,19 @@ static bool metal_graph_eval_token_raw_swa(
                 ok = ok && metal_graph_encode_decode_layer(g, model, layer, il,
                          pos, g->layer_raw_cache[il], g->raw_cap,
                          pos % g->raw_cap, n_raw, token, false, 1);
-                ok = ok && ds4_gpu_decode_graph_capture_end_store(0, (int)il);
+                if (ok) ok = ds4_gpu_decode_graph_capture_end_store(0, (int)il);
+                else (void)ds4_gpu_decode_graph_capture_end_store(0, -1); /* abort capture */
+
+                /* Run router (outside capture) for post-router */
+                /* (router runs during normal encode below, not here) */
 
                 /* Capture post-router sub-graph */
                 ok = ok && ds4_gpu_decode_graph_capture();
                 ok = ok && metal_graph_encode_decode_layer(g, model, layer, il,
                          pos, g->layer_raw_cache[il], g->raw_cap,
                          pos % g->raw_cap, n_raw, token, false, 2);
-                ok = ok && ds4_gpu_decode_graph_capture_end_store(1, (int)il);
+                if (ok) ok = ds4_gpu_decode_graph_capture_end_store(1, (int)il);
+                else (void)ds4_gpu_decode_graph_capture_end_store(1, -1); /* abort capture */
             }
             memcpy(g->layer_n_comp, saved_n_comp, sizeof(saved_n_comp));
             memcpy(g->layer_n_index_comp, saved_n_index_comp, sizeof(saved_n_index_comp));

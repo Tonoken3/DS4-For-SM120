@@ -897,6 +897,9 @@ int ds4_gpu_pp_p2p_copy(int dst_gpu, int src_gpu);
 int ds4_gpu_pp_p2p_copy_ptr(int dst_gpu, int src_gpu,
                              void *dst_ptr, void *src_ptr,
                              uint64_t bytes);
+int ds4_gpu_pp_p2p_copy_ordered_async(int dst_gpu, int src_gpu,
+                                      void *dst_ptr, void *src_ptr,
+                                      uint64_t bytes);
 
 int ds4_gpu_pp_event_record(int gpu);
 int ds4_gpu_pp_stream_wait_event(int gpu, int event_gpu);

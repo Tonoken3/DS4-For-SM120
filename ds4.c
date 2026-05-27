@@ -43,10 +43,13 @@
 
 #ifndef DS4_NO_GPU
 #include "ds4_gpu.h"
-/* Forward declarations for PP async functions not in ds4_gpu.h */
+/* Forward declarations for PP async helpers. */
 extern int ds4_gpu_pp_p2p_copy_async(int dst_gpu, int src_gpu,
                                       void *dst_ptr, void *src_ptr,
                                       uint64_t bytes, void *stream);
+extern int ds4_gpu_pp_p2p_copy_ordered_async(int dst_gpu, int src_gpu,
+                                              void *dst_ptr, void *src_ptr,
+                                              uint64_t bytes);
 extern int ds4_gpu_pp_event_record(int gpu);
 extern int ds4_gpu_pp_stream_wait_event(int gpu, int event_gpu);
 extern void *ds4_gpu_pp_stream_get(int gpu);
@@ -11908,6 +11911,7 @@ static bool metal_graph_encode_token_raw_swa_pp(
     }
     const uint32_t raw_row = pos % g0->raw_cap;
     const uint32_t n_raw = metal_graph_raw_span_for_batch(g0, pos, 1);
+    const bool async_p2p = getenv("DS4_CUDA_PP_ASYNC_P2P") != NULL;
 
     ds4_gpu_pp_set_device(0);
     ds4_debug_decode_symbol_token("pp_embed_before", (uint32_t)token, (uint32_t)weights->token_embd->dim[1]);
@@ -11942,24 +11946,39 @@ static bool metal_graph_encode_token_raw_swa_pp(
         }
         if (ok && gp + 1 < ngpu) {
             /* After the layer loop, cur_hc holds the final output of this GPU.
-               cudaMemcpyPeer is synchronous w.r.t. host, but we must ensure
-               the source device's kernels (on any stream) have finished first. */
-            ds4_gpu_synchronize();
-            ok = ds4_gpu_pp_p2p_copy_ptr(gp + 1, gp,
-                ds4_gpu_tensor_device_ptr(pp[gp + 1].g.cur_hc),
-                ds4_gpu_tensor_device_ptr(gg->cur_hc),
-                ds4_gpu_tensor_bytes(gg->cur_hc)) != 0;
+               The async path records on the source work stream, copies on the
+               destination PP stream, then makes the destination work stream
+               wait before the next GPU consumes the activation. */
+            if (async_p2p) {
+                ok = ds4_gpu_pp_p2p_copy_ordered_async(gp + 1, gp,
+                    ds4_gpu_tensor_device_ptr(pp[gp + 1].g.cur_hc),
+                    ds4_gpu_tensor_device_ptr(gg->cur_hc),
+                    ds4_gpu_tensor_bytes(gg->cur_hc)) != 0;
+            } else {
+                ds4_gpu_synchronize();
+                ok = ds4_gpu_pp_p2p_copy_ptr(gp + 1, gp,
+                    ds4_gpu_tensor_device_ptr(pp[gp + 1].g.cur_hc),
+                    ds4_gpu_tensor_device_ptr(gg->cur_hc),
+                    ds4_gpu_tensor_bytes(gg->cur_hc)) != 0;
+            }
         }
     }
 
     if (ok && need_logits) {
         int last = ngpu - 1;
-        ds4_gpu_pp_set_device(last);
-        ds4_gpu_synchronize();
-        ok = ds4_gpu_pp_p2p_copy_ptr(0, last,
-            ds4_gpu_tensor_device_ptr(g0->cur_hc),
-            ds4_gpu_tensor_device_ptr(pp[last].g.cur_hc),
-            ds4_gpu_tensor_bytes(pp[last].g.cur_hc)) != 0;
+        if (async_p2p) {
+            ok = ds4_gpu_pp_p2p_copy_ordered_async(0, last,
+                ds4_gpu_tensor_device_ptr(g0->cur_hc),
+                ds4_gpu_tensor_device_ptr(pp[last].g.cur_hc),
+                ds4_gpu_tensor_bytes(pp[last].g.cur_hc)) != 0;
+        } else {
+            ds4_gpu_pp_set_device(last);
+            ds4_gpu_synchronize();
+            ok = ds4_gpu_pp_p2p_copy_ptr(0, last,
+                ds4_gpu_tensor_device_ptr(g0->cur_hc),
+                ds4_gpu_tensor_device_ptr(pp[last].g.cur_hc),
+                ds4_gpu_tensor_bytes(pp[last].g.cur_hc)) != 0;
+        }
         ds4_gpu_pp_set_device(0);
         ok = metal_graph_encode_output_head(g0, model, weights, weights->output->dim[1]);
     }

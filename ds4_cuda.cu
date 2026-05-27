@@ -464,6 +464,7 @@ static float *g_pp_active[7];
 static ncclComm_t g_pp_nccl_comms[7];
 static int g_pp_nccl_ready;
 static cudaEvent_t g_pp_event[DS4_CUDA_MAX_DEVICES];
+static cudaEvent_t g_pp_copy_event[DS4_CUDA_MAX_DEVICES];
 static int g_moe_scratch_inited;
 
 /* Persistent MoE scratch: pre-allocated buffer for one layer's full expert
@@ -1953,11 +1954,15 @@ static int ds4_gpu_pp_init(void) {
         for (int g = 0; g < ngpu; g++) {
             cudaSetDevice(g);
             if (!g_pp_stream[g]) {
-                cudaError_t ce = cudaStreamCreate(&g_pp_stream[g]);
+                cudaError_t ce = cudaStreamCreateWithFlags(&g_pp_stream[g], cudaStreamNonBlocking);
                 if (ce != cudaSuccess) { ok = 0; break; }
             }
             if (!g_pp_event[g]) {
-                cudaError_t ce = cudaEventCreate(&g_pp_event[g]);
+                cudaError_t ce = cudaEventCreateWithFlags(&g_pp_event[g], cudaEventDisableTiming);
+                if (ce != cudaSuccess) { ok = 0; break; }
+            }
+            if (!g_pp_copy_event[g]) {
+                cudaError_t ce = cudaEventCreateWithFlags(&g_pp_copy_event[g], cudaEventDisableTiming);
                 if (ce != cudaSuccess) { ok = 0; break; }
             }
         }
@@ -2041,6 +2046,7 @@ extern "C" int ds4_gpu_pp_p2p_copy_async(int dst_gpu, int src_gpu,
                                           void *dst_ptr, void *src_ptr,
                                           uint64_t bytes, cudaStream_t stream) {
     if (!dst_ptr || !src_ptr || bytes == 0) return 0;
+    cudaSetDevice(dst_gpu);
     cudaError_t ce = cudaMemcpyPeerAsync(dst_ptr, dst_gpu, src_ptr, src_gpu, (size_t)bytes, stream);
     return ce == cudaSuccess ? 1 : 0;
 }
@@ -2048,7 +2054,7 @@ extern "C" int ds4_gpu_pp_p2p_copy_async(int dst_gpu, int src_gpu,
 extern "C" int ds4_gpu_pp_event_record(int gpu) {
     if (gpu < 0 || gpu >= DS4_CUDA_MAX_DEVICES || !g_pp_event[gpu]) return 0;
     cudaSetDevice(gpu);
-    return cudaEventRecord(g_pp_event[gpu], g_pp_stream[gpu]) == cudaSuccess ? 1 : 0;
+    return cudaEventRecord(g_pp_event[gpu], ds4_decode_stream()) == cudaSuccess ? 1 : 0;
 }
 
 extern "C" int ds4_gpu_pp_stream_wait_event(int gpu, int event_gpu) {
@@ -2061,6 +2067,53 @@ extern "C" int ds4_gpu_pp_stream_wait_event(int gpu, int event_gpu) {
 extern "C" void *ds4_gpu_pp_stream_get(int gpu) {
     if (gpu < 0 || gpu >= DS4_CUDA_MAX_DEVICES) return NULL;
     return g_pp_stream[gpu];
+}
+
+extern "C" int ds4_gpu_pp_p2p_copy_ordered_async(int dst_gpu, int src_gpu,
+                                                   void *dst_ptr, void *src_ptr,
+                                                   uint64_t bytes) {
+    if (!dst_ptr || !src_ptr || bytes == 0) return 0;
+    if (dst_gpu < 0 || dst_gpu >= DS4_CUDA_MAX_DEVICES || src_gpu < 0 || src_gpu >= DS4_CUDA_MAX_DEVICES) return 0;
+    if (!g_pp_stream[dst_gpu] || !g_pp_event[src_gpu] || !g_pp_copy_event[dst_gpu]) return 0;
+
+    cudaSetDevice(src_gpu);
+    cudaStream_t src_work_stream = ds4_decode_stream();
+    cudaError_t ce = cudaEventRecord(g_pp_event[src_gpu], src_work_stream);
+    if (ce != cudaSuccess) {
+        fprintf(stderr, "ds4: PP async source event record failed gpu%d: %s\n",
+                src_gpu, cudaGetErrorString(ce));
+        return 0;
+    }
+
+    cudaSetDevice(dst_gpu);
+    cudaStream_t dst_copy_stream = g_pp_stream[dst_gpu];
+    ce = cudaStreamWaitEvent(dst_copy_stream, g_pp_event[src_gpu], 0);
+    if (ce != cudaSuccess) {
+        fprintf(stderr, "ds4: PP async copy stream wait failed gpu%d<-gpu%d: %s\n",
+                dst_gpu, src_gpu, cudaGetErrorString(ce));
+        return 0;
+    }
+    ce = cudaMemcpyPeerAsync(dst_ptr, dst_gpu, src_ptr, src_gpu, (size_t)bytes, dst_copy_stream);
+    if (ce != cudaSuccess) {
+        fprintf(stderr, "ds4: PP async cudaMemcpyPeerAsync failed gpu%d<-gpu%d: %s\n",
+                dst_gpu, src_gpu, cudaGetErrorString(ce));
+        return 0;
+    }
+    ce = cudaEventRecord(g_pp_copy_event[dst_gpu], dst_copy_stream);
+    if (ce != cudaSuccess) {
+        fprintf(stderr, "ds4: PP async copy event record failed gpu%d: %s\n",
+                dst_gpu, cudaGetErrorString(ce));
+        return 0;
+    }
+
+    cudaStream_t dst_work_stream = ds4_decode_stream();
+    ce = cudaStreamWaitEvent(dst_work_stream, g_pp_copy_event[dst_gpu], 0);
+    if (ce != cudaSuccess) {
+        fprintf(stderr, "ds4: PP async destination stream wait failed gpu%d<-gpu%d: %s\n",
+                dst_gpu, src_gpu, cudaGetErrorString(ce));
+        return 0;
+    }
+    return 1;
 }
 
 extern "C" void ds4_gpu_model_range_reserve(void) {
@@ -2233,6 +2286,7 @@ extern "C" void ds4_gpu_cleanup(void) {
             cudaSetDevice(g);
             if (g_pp_stream[g]) { (void)cudaStreamDestroy(g_pp_stream[g]); g_pp_stream[g] = NULL; }
             if (g_pp_event[g]) { (void)cudaEventDestroy(g_pp_event[g]); g_pp_event[g] = NULL; }
+            if (g_pp_copy_event[g]) { (void)cudaEventDestroy(g_pp_copy_event[g]); g_pp_copy_event[g] = NULL; }
             (void)cudaFree(g_pp_active[g]);
             g_pp_active[g] = NULL;
         }

@@ -13726,10 +13726,15 @@ static bool metal_graph_eval_token_raw_swa(
         const int replay_enabled = getenv("DS4_CUDA_SUBGRAPH_REPLAY") != NULL;
 
         if (replay_enabled && subgraphs_ready) {
-            /* Phase D: per-layer pre+post sub-graph replay (86 graphs) */
+            /* Phase E: per-layer pre+post replay with kernel arg patching */
             for (uint32_t il = 0; il < DS4_N_LAYER && ok; il++) {
+                uint32_t n_raw = (uint32_t)pos + 1;
+                if (n_raw > g->raw_window) n_raw = g->raw_window;
+                if (n_raw > g->raw_cap) n_raw = g->raw_cap;
+                ds4_gpu_decode_graph_patch_pre((int)il, pos, pos % g->raw_cap, n_raw);
                 ok = ok && ds4_gpu_decode_subgraph_launch(0, (int)il);
-                /* TODO Phase E: run router here between pre and post graphs */
+                /* TODO: run router + compact fill between pre and post graphs */
+                ds4_gpu_decode_graph_patch_post((int)il, pos);
                 ok = ok && ds4_gpu_decode_subgraph_launch(1, (int)il);
             }
             if (profile) t_encoded = now_sec();

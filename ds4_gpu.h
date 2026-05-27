@@ -871,6 +871,17 @@ int ds4_gpu_decode_graph_capture_end_store(int part, int layer);
 int ds4_gpu_decode_subgraph_launch(int part, int layer);
 int ds4_gpu_decode_subgraphs_ready(void);
 
+/* Phase E: kernel argument patching for graph replay */
+typedef enum {
+    DS4_GRAPH_PATCH_NONE = 0,
+    DS4_GRAPH_PATCH_EMBED_TOKEN,
+    DS4_GRAPH_PATCH_ROPE_POS,
+    DS4_GRAPH_PATCH_RAW_KV,
+} ds4_graph_patch_kind;
+
+int ds4_gpu_decode_graph_patch_pre(int layer, uint32_t pos, uint32_t raw_row, uint32_t n_raw);
+int ds4_gpu_decode_graph_patch_post(int layer, uint32_t pos);
+
 /* PP (Pipeline Parallelism) export API */
 int ds4_gpu_pp_set_device(int g);
 int ds4_gpu_pp_enabled(void);

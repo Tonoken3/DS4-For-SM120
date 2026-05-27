@@ -107,6 +107,13 @@ static cudaGraphExec_t g_cuda_decode_graph_exec;
 static int g_cuda_decode_graph_captured;
 static cudaGraphExec_t g_sub_graph_exec[2][43];
 static int g_sub_graph_exec_ready[2][43];
+/* Phase E: kernel patch records */
+typedef struct {
+    cudaGraphNode_t node;
+    cudaKernelNodeParams params;
+} local_kernel_patch;
+static local_kernel_patch g_local_patches[2][43][16];
+static int g_graph_patch_count[2][43];
 static int g_decode_graph_capture_disabled_notice_printed;
 
 static int cuda_model_direct_host_access_allowed(void);
@@ -211,27 +218,23 @@ extern "C" int ds4_gpu_decode_graph_capture_end_store(int part, int layer) {
     }
     ce = cudaGraphInstantiate(&g_sub_graph_exec[part][layer], graph, NULL, NULL, 0);
 
-    /* Phase B: graph node inventory (profile only) */
-    if (getenv("DS4_CUDA_DECODE_GRAPH_PROFILE") != NULL || layer == 0) {
+    /* Phase E: collect kernel node patches */
+    {
         size_t n = 0;
-        if (cudaGraphGetNodes(graph, NULL, &n) == cudaSuccess) {
-            if (n > 0) {
-                std::vector<cudaGraphNode_t> nodes(n);
-                (void)cudaGraphGetNodes(graph, nodes.data(), &n);
-                int n_kernel = 0, n_memcpy = 0, n_other = 0;
-                for (size_t i = 0; i < n; i++) {
-                    cudaGraphNodeType t;
-                    if (cudaGraphNodeGetType(nodes[i], &t) == cudaSuccess) {
-                        if (t == cudaGraphNodeTypeKernel) n_kernel++;
-                        else if (t == cudaGraphNodeTypeMemcpy) n_memcpy++;
-                        else n_other++;
-                    }
-                }
-                if (layer == 0) {
-                    fprintf(stderr, "ds4: graph node metrics (layer 0): %zu nodes, %d kernel, %d memcpy, %d other\n",
-                            n, n_kernel, n_memcpy, n_other);
-                }
+        if (cudaGraphGetNodes(graph, NULL, &n) == cudaSuccess && n > 0) {
+            std::vector<cudaGraphNode_t> nodes(n);
+            (void)cudaGraphGetNodes(graph, nodes.data(), &n);
+            int pc = 0;
+            for (size_t i = 0; i < n && pc < 16; i++) {
+                cudaGraphNodeType t;
+                if (cudaGraphNodeGetType(nodes[i], &t) != cudaSuccess) continue;
+                if (t != cudaGraphNodeTypeKernel) continue;
+                cudaKernelNodeParams kp = {};
+                if (cudaGraphKernelNodeGetParams(nodes[i], &kp) != cudaSuccess) continue;
+                local_kernel_patch lp = { nodes[i], kp };
+                g_local_patches[part][layer][pc++] = lp;
             }
+            g_graph_patch_count[part][layer] = pc;
         } else {
             (void)cudaGetLastError();
         }
@@ -245,6 +248,26 @@ extern "C" int ds4_gpu_decode_graph_capture_end_store(int part, int layer) {
 extern "C" int ds4_gpu_decode_subgraph_launch(int part, int layer) {
     if (layer < 0 || layer >= 43 || !g_sub_graph_exec[part][layer]) return 0;
     return cudaGraphLaunch(g_sub_graph_exec[part][layer], ds4_decode_stream()) == cudaSuccess ? 1 : 0;
+}
+
+extern "C" int ds4_gpu_decode_graph_patch_pre(int layer, uint32_t pos, uint32_t raw_row, uint32_t n_raw) {
+    int pc = g_graph_patch_count[0][layer];
+    for (int i = 0; i < pc; i++) {
+        local_kernel_patch *p = &g_local_patches[0][layer][i];
+        (void)cudaGraphKernelNodeSetParams(p->node, &p->params);
+    }
+    (void)pos; (void)raw_row; (void)n_raw;
+    return 1;
+}
+
+extern "C" int ds4_gpu_decode_graph_patch_post(int layer, uint32_t pos) {
+    int pc = g_graph_patch_count[1][layer];
+    for (int i = 0; i < pc; i++) {
+        local_kernel_patch *p = &g_local_patches[1][layer][i];
+        (void)cudaGraphKernelNodeSetParams(p->node, &p->params);
+    }
+    (void)pos;
+    return 1;
 }
 
 extern "C" int ds4_gpu_decode_subgraphs_ready(void) {

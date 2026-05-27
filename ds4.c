@@ -18319,6 +18319,52 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         }
         ds4_gpu_set_quality(e->quality);
         (void)ds4_gpu_set_model_fd(e->model.fd);
+
+        /* PP weight cache: load all weights for assigned layers to each GPU */
+        if (ds4_gpu_pp_enabled()) {
+            fprintf(stderr, "ds4: PP caching per-GPU weights...\n");
+            int ngpu = ds4_gpu_pp_ngpu();
+            int tensor_limit_gb = ngpu * 12; /* ~12 GB per GPU */
+            char limit_buf[32];
+            snprintf(limit_buf, sizeof(limit_buf), "%d", tensor_limit_gb);
+            setenv("DS4_CUDA_WEIGHT_CACHE_LIMIT_GB", limit_buf, 1);
+
+            uint64_t total_cached = 0;
+            for (int g = 0; g < ngpu; g++) {
+                ds4_gpu_pp_set_device(g);
+                int l0 = ds4_gpu_pp_layer_start(g);
+                int l1 = ds4_gpu_pp_layer_end(g);
+                if (l0 < 0) continue;
+                for (uint64_t ti = 0; ti < e->model.n_tensors; ti++) {
+                    const ds4_tensor *t = &e->model.tensors[ti];
+                    if (t->bytes == 0) continue;
+                    /* Parse layer number from tensor name: blk.N.xxx */
+                    int bl = -1;
+                    if (t->name.len > 4 && memcmp(t->name.ptr, "blk.", 4) == 0) {
+                        uint64_t pos = 4;
+                        while (pos < t->name.len && t->name.ptr[pos] >= '0' && t->name.ptr[pos] <= '9') {
+                            bl = (bl < 0 ? 0 : bl * 10) + (t->name.ptr[pos] - '0');
+                            pos++;
+                        }
+                    }
+                    if (bl < l0 || bl > l1) continue;
+                    /* Cache this tensor on this GPU */
+                    char label[128];
+                    snprintf(label, sizeof(label), "pp:%.*s", (int)(t->name.len > 120 ? 120 : t->name.len), t->name.ptr);
+                    if (ds4_gpu_cache_model_range(e->model.map, e->model.size,
+                          t->abs_offset, t->bytes, label)) {
+                        total_cached += t->bytes;
+                    }
+                }
+                /* Force cache sync */
+                ds4_gpu_end_commands();
+                fprintf(stderr, "ds4: PP GPU %d: layers %d-%d cached\n",
+                        g, l0, l1);
+            }
+            ds4_gpu_pp_set_device(0);
+            fprintf(stderr, "ds4: PP weight cache done, %.2f GiB total\n",
+                    (double)total_cached/1073741824.0);
+        }
         if (!ds4_gpu_set_model_map_range(e->model.map,
                                            e->model.size,
                                            e->model.tensor_data_pos,

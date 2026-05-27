@@ -554,16 +554,26 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
         auto exact = g_model_range_by_offset.find(offset);
         if (exact != g_model_range_by_offset.end()) {
             const cuda_model_range &r = g_model_ranges[exact->second];
-            if (r.host_base == model_map && end >= offset && bytes <= r.bytes && r.device == current_dev) return r.device_ptr;
+            if (r.host_base == model_map && end >= offset && bytes <= r.bytes &&
+                r.device == current_dev && !r.host_registered) {
+                return r.device_ptr;
+            }
         }
     }
     const char *fallback = NULL;
     for (const cuda_model_range &r : g_model_ranges) {
         if (r.host_base == model_map && offset >= r.offset && end >= offset && end <= r.offset + r.bytes) {
-            if (r.device == current_dev) return r.device_ptr + (offset - r.offset);
+            if (r.device == current_dev && !r.host_registered) {
+                return r.device_ptr + (offset - r.offset);
+            }
+            if (g_pp_decode_active) {
+                if (!fallback) fallback = r.device_ptr + (offset - r.offset);
+                continue;
+            }
             if (!fallback) fallback = r.device_ptr + (offset - r.offset);
         }
-        if (r.host_base == model_map && r.host_registered && r.registered_base && r.registered_device_base) {
+        if (!g_pp_decode_active &&
+            r.host_base == model_map && r.host_registered && r.registered_base && r.registered_device_base) {
             const uintptr_t h0 = (uintptr_t)((const char *)model_map + offset);
             const uintptr_t h1 = h0 + bytes;
             const uintptr_t r0 = (uintptr_t)r.registered_base;
@@ -2174,6 +2184,23 @@ extern "C" void ds4_gpu_debug_tensor_ptr(const char *name, ds4_gpu_tensor *t) {
                 name, t->ptr, attr.device, (int)attr.type, (unsigned long)t->bytes);
     } else {
         fprintf(stderr, "ds4: %s ptr=%p attr failed: %s\n", name, t->ptr, cudaGetErrorString(err));
+    }
+}
+
+static void ds4_debug_ptr_attr_raw(const char *name, const void *p) {
+    int cur = -1;
+    cudaGetDevice(&cur);
+    cudaPointerAttributes a;
+    cudaError_t e = cudaPointerGetAttributes(&a, p);
+    if (e == cudaSuccess) {
+        fprintf(stderr,
+                "ds4: %s ptr=%p current_dev=%d attr.device=%d attr.type=%d\n",
+                name, p, cur, a.device, (int)a.type);
+    } else {
+        fprintf(stderr,
+                "ds4: %s ptr=%p current_dev=%d attr failed: %s\n",
+                name, p, cur, cudaGetErrorString(e));
+        cudaGetLastError();
     }
 }
 
@@ -6378,6 +6405,59 @@ __global__ static void topk_mask_kernel(float *mask, const uint32_t *topk, uint3
     mask[gid] = v;
 }
 
+static int ds4_gpu_embed_token_hc_cpu_fallback(
+        ds4_gpu_tensor *out_hc,
+        const char *wptr,
+        uint32_t token,
+        uint32_t n_vocab,
+        uint32_t n_embd,
+        uint32_t n_hc) {
+    if (!out_hc || !wptr || n_embd == 0 || n_hc == 0) return 0;
+    if (token >= n_vocab) token = 0;
+
+    const uint64_t row_bytes = (uint64_t)n_embd * sizeof(uint16_t);
+    uint16_t *row = (uint16_t *)malloc((size_t)row_bytes);
+    float *out = (float *)malloc((size_t)((uint64_t)n_embd * n_hc * sizeof(float)));
+    if (!row || !out) {
+        free(row);
+        free(out);
+        return 0;
+    }
+
+    const uint64_t row_off = (uint64_t)token * n_embd * sizeof(uint16_t);
+    cudaError_t ce = cudaMemcpy(row, wptr + row_off, (size_t)row_bytes,
+                                cudaMemcpyDeviceToHost);
+    if (ce != cudaSuccess) {
+        fprintf(stderr, "ds4: CPU embed row read failed: %s\n", cudaGetErrorString(ce));
+        cudaGetLastError();
+        free(row);
+        free(out);
+        return 0;
+    }
+
+    for (uint32_t h = 0; h < n_hc; ++h) {
+        for (uint32_t e = 0; e < n_embd; ++e) {
+            __half hv;
+            memcpy(&hv, &row[e], sizeof(hv));
+            out[(uint64_t)h * n_embd + e] = __half2float(hv);
+        }
+    }
+
+    ce = cudaMemcpy(out_hc->ptr, out,
+                    (size_t)((uint64_t)n_embd * n_hc * sizeof(float)),
+                    cudaMemcpyHostToDevice);
+
+    free(row);
+    free(out);
+
+    if (ce != cudaSuccess) {
+        fprintf(stderr, "ds4: CPU embed output upload failed: %s\n", cudaGetErrorString(ce));
+        cudaGetLastError();
+        return 0;
+    }
+    return 1;
+}
+
 extern "C" int ds4_gpu_embed_token_hc_tensor(ds4_gpu_tensor *out_hc, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n_vocab, uint32_t token, uint32_t n_embd, uint32_t n_hc) {
     if (!out_hc || !model_map || weight_offset >= model_size) return 0;
     uint64_t weight_bytes = (uint64_t)n_vocab * n_embd * sizeof(uint16_t);
@@ -6385,16 +6465,31 @@ extern "C" int ds4_gpu_embed_token_hc_tensor(ds4_gpu_tensor *out_hc, const void 
     if (token >= n_vocab) token = 0;
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "token_embd");
     if (!wptr) return 0;
-    uint64_t n = (uint64_t)n_embd * n_hc;
-    /* Verify wptr contains valid data */
-    __half first_val;
-    cudaError_t ce = cudaMemcpy(&first_val, wptr, sizeof(first_val), cudaMemcpyDeviceToHost);
-    if (ce != cudaSuccess) {
-        fprintf(stderr, "ds4: embed token wptr readback failed: %s\n", cudaGetErrorString(ce));
+    ds4_debug_ptr_attr_raw("embed token wptr", wptr);
+    ds4_debug_ptr_attr_raw("embed token out_hc", out_hc->ptr);
+    /* Read actual row accessed by kernel (token * n_embd) */
+    const uint64_t tok = token < n_vocab ? token : 0;
+    const uint64_t row_bytes = tok * (uint64_t)n_embd * sizeof(uint16_t);
+    __half v0, v_last;
+    cudaError_t ce = cudaMemcpy(&v0, wptr + row_bytes, sizeof(v0), cudaMemcpyDeviceToHost);
+    cudaError_t ce_last = cudaMemcpy(&v_last,
+            wptr + row_bytes + (uint64_t)(n_embd - 1) * sizeof(uint16_t),
+            sizeof(v_last), cudaMemcpyDeviceToHost);
+    fprintf(stderr,
+            "ds4: embed row read token=%u row_off=%llu first=%s/%g last=%s/%g\n",
+            token,
+            (unsigned long long)row_bytes,
+            cudaGetErrorString(ce), ce == cudaSuccess ? __half2float(v0) : 0.0f,
+            cudaGetErrorString(ce_last), ce_last == cudaSuccess ? __half2float(v_last) : 0.0f);
+    if (ce != cudaSuccess || ce_last != cudaSuccess) {
         (void)cudaGetLastError();
         return 0;
     }
-    fprintf(stderr, "ds4: embed token wptr first_val=%g\n", __half2float(first_val));
+    if (getenv("DS4_CUDA_PP_CPU_EMBED") != NULL) {
+        return ds4_gpu_embed_token_hc_cpu_fallback(
+            out_hc, wptr, token, n_vocab, n_embd, n_hc);
+    }
+    uint64_t n = (uint64_t)n_embd * n_hc;
     embed_token_hc_kernel<<<(n + 255) / 256, 256, 0, ds4_decode_stream()>>>(
         (float *)out_hc->ptr, (const unsigned short *)wptr,
         token, n_vocab, n_embd, n_hc);

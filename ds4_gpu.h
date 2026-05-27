@@ -912,4 +912,10 @@ int ds4_gpu_cache_model_range_force(const void *model_map, uint64_t model_size,
 /* Debug: print tensor pointer and device attributes */
 void ds4_gpu_debug_tensor_ptr(const char *name, ds4_gpu_tensor *t);
 
+/* Deactivate decode params on all GPUs before PP decode */
+void ds4_gpu_pp_deactivate_decode_params_all(int ngpu);
+
+/* Debug: read device symbol decode params */
+void ds4_debug_decode_symbol_token(const char *where, uint32_t host_token, uint32_t n_vocab);
+
 #endif

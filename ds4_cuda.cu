@@ -102,6 +102,7 @@ static cudaStream_t ds4_decode_stream(void) {
     if (!g_cuda_decode_stream_created) return 0;
     /* In PP mode, only GPU 0's decode stream is valid.
      * Other GPUs must use their default stream (0). */
+    if (getenv("DS4_CUDA_PP_DEFAULT_STREAM") != NULL) return 0;
     int dev = 0;
     if (cudaGetDevice(&dev) == cudaSuccess && dev != 0) return 0;
     return g_cuda_decode_stream;
@@ -153,6 +154,30 @@ extern "C" int ds4_gpu_decode_params_deactivate(void) {
             ds4_cuda_params_active, &inactive, sizeof(inactive), 0, cudaMemcpyHostToDevice, s);
     if (ce != cudaSuccess) { (void)cudaGetLastError(); return 0; }
     return 1;
+}
+
+extern "C" void ds4_gpu_pp_deactivate_decode_params_all(int ngpu) {
+    int saved = 0;
+    (void)cudaGetDevice(&saved);
+    for (int g = 0; g < ngpu; ++g) {
+        (void)cudaSetDevice(g);
+        (void)ds4_gpu_decode_params_deactivate();
+        (void)cudaDeviceSynchronize();
+        (void)cudaGetLastError();
+    }
+    (void)cudaSetDevice(saved);
+}
+
+extern "C" void ds4_debug_decode_symbol_token(const char *where, uint32_t host_token, uint32_t n_vocab) {
+    int dev = -1;
+    (void)cudaGetDevice(&dev);
+    int active = -1;
+    ds4_cuda_decode_params p;
+    memset(&p, 0, sizeof(p));
+    cudaMemcpyFromSymbol(&active, ds4_cuda_params_active, sizeof(active), 0, cudaMemcpyDeviceToHost);
+    cudaMemcpyFromSymbol(&p, ds4_cuda_dev_params, sizeof(p), 0, cudaMemcpyDeviceToHost);
+    fprintf(stderr, "ds4: %s dev=%d active=%d sym_token=%d host_token=%u n_vocab=%u\n",
+            where, dev, active, p.token, host_token, n_vocab);
 }
 
 /* Phase 3: Capture the work submitted to the decode stream since the last
@@ -546,7 +571,32 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
             if (h1 >= h0 && h0 >= r0 && h1 <= r1) return r.registered_device_base + (h0 - r0);
         }
     }
-    if (fallback) return fallback;
+    if (fallback) {
+        if (g_pp_decode_active) {
+            fprintf(stderr,
+                    "ds4: PP weight cache miss on current device; refusing fallback "
+                    "dev=%d off=%llu bytes=%llu what=%s fallback=%p\n",
+                    current_dev,
+                    (unsigned long long)offset,
+                    (unsigned long long)bytes,
+                    what ? what : "?",
+                    (const void *)fallback);
+            return NULL;
+        }
+        return fallback;
+    }
+
+    if (g_pp_decode_active) {
+        fprintf(stderr,
+                "ds4: PP weight cache miss dev=%d off=%llu bytes=%llu what=%s; "
+                "refusing host/global fallback\n",
+                current_dev,
+                (unsigned long long)offset,
+                (unsigned long long)bytes,
+                what ? what : "?");
+        return NULL;
+    }
+
     if (g_model_device_owned || g_model_registered) return cuda_model_ptr(model_map, offset);
     if (cuda_model_direct_host_access_allowed()) return cuda_model_ptr(model_map, offset);
 
@@ -2408,13 +2458,14 @@ extern "C" void ds4_gpu_set_quality(bool quality) {
     }
 }
 
-__global__ static void embed_token_hc_kernel(float *out, const unsigned short *w, uint32_t token, uint32_t n_embd, uint32_t n_hc) {
-    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    uint32_t n = n_embd * n_hc;
+__global__ static void embed_token_hc_kernel(float *out, const unsigned short *w, uint32_t token, uint32_t n_vocab, uint32_t n_embd, uint32_t n_hc) {
+    uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t n = (uint64_t)n_embd * n_hc;
     if (i >= n) return;
-    uint32_t e = i % n_embd;
+    uint32_t e = (uint32_t)(i % n_embd);
     int32_t tok = ds4_cuda_params_active ? (int32_t)ds4_cuda_dev_params.token : (int32_t)token;
     uint32_t t = tok < 0 ? 0u : (uint32_t)tok;
+    if (t >= n_vocab) t = 0u;
     out[i] = __half2float(reinterpret_cast<const __half *>(w)[(uint64_t)t * n_embd + e]);
 }
 
@@ -6328,14 +6379,25 @@ __global__ static void topk_mask_kernel(float *mask, const uint32_t *topk, uint3
 }
 
 extern "C" int ds4_gpu_embed_token_hc_tensor(ds4_gpu_tensor *out_hc, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n_vocab, uint32_t token, uint32_t n_embd, uint32_t n_hc) {
-    (void)n_vocab;
     if (!out_hc || !model_map || weight_offset >= model_size) return 0;
     uint64_t weight_bytes = (uint64_t)n_vocab * n_embd * sizeof(uint16_t);
     if (weight_offset > model_size || weight_bytes > model_size - weight_offset) return 0;
+    if (token >= n_vocab) token = 0;
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "token_embd");
     if (!wptr) return 0;
-    uint32_t n = n_embd * n_hc;
-    embed_token_hc_kernel<<<(n + 255) / 256, 256, 0, ds4_decode_stream()>>>((float *)out_hc->ptr, (const unsigned short *)wptr, token, n_embd, n_hc);
+    uint64_t n = (uint64_t)n_embd * n_hc;
+    /* Verify wptr contains valid data */
+    __half first_val;
+    cudaError_t ce = cudaMemcpy(&first_val, wptr, sizeof(first_val), cudaMemcpyDeviceToHost);
+    if (ce != cudaSuccess) {
+        fprintf(stderr, "ds4: embed token wptr readback failed: %s\n", cudaGetErrorString(ce));
+        (void)cudaGetLastError();
+        return 0;
+    }
+    fprintf(stderr, "ds4: embed token wptr first_val=%g\n", __half2float(first_val));
+    embed_token_hc_kernel<<<(n + 255) / 256, 256, 0, ds4_decode_stream()>>>(
+        (float *)out_hc->ptr, (const unsigned short *)wptr,
+        token, n_vocab, n_embd, n_hc);
     return cuda_ok(cudaGetLastError(), "embed token launch");
 }
 

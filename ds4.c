@@ -11903,16 +11903,25 @@ static bool metal_graph_encode_token_raw_swa_pp(
     const uint32_t n_raw = metal_graph_raw_span_for_batch(g0, pos, 1);
 
     ds4_gpu_pp_set_device(0);
-    bool ok = ds4_gpu_embed_token_hc_tensor(g0->cur_hc,
-                                              model->map,
-                                              model->size,
-                                              weights->token_embd->abs_offset,
-                                              (uint32_t)weights->token_embd->dim[1],
-                                              (uint32_t)token,
-                                              DS4_N_EMBD,
-                                              DS4_N_HC) != 0;
+    ds4_debug_decode_symbol_token("pp_embed_before", (uint32_t)token, (uint32_t)weights->token_embd->dim[1]);
+    /* Test: fill cur_hc with zeros to check if memory is accessible without kernel */
+    bool ok = ds4_gpu_tensor_fill_f32(g0->cur_hc, 0.0f, ds4_gpu_tensor_bytes(g0->cur_hc) / sizeof(float)) != 0;
     if (ok) ok = ds4_gpu_synchronize() != 0;
-    if (!ok) fprintf(stderr, "ds4: PP embed token failed\n");
+    if (!ok) {
+        fprintf(stderr, "ds4: PP memset test FAILED - memory is not accessible\n");
+    } else {
+        fprintf(stderr, "ds4: PP memset test OK - memory is accessible\n");
+        ok = ds4_gpu_embed_token_hc_tensor(g0->cur_hc,
+                                                  model->map,
+                                                  model->size,
+                                                  weights->token_embd->abs_offset,
+                                                  (uint32_t)weights->token_embd->dim[1],
+                                                  (uint32_t)token,
+                                                  DS4_N_EMBD,
+                                                  DS4_N_HC) != 0;
+        if (ok) ok = ds4_gpu_synchronize() != 0;
+        if (!ok) fprintf(stderr, "ds4: PP embed token failed\n");
+    }
 
     for (int gp = 0; ok && gp < ngpu; gp++) {
         ds4_gpu_pp_set_device(gp);
@@ -16815,6 +16824,10 @@ static int generate_metal_graph_raw_swa(
     ds4_gpu_model_range_reserve();
         }
         ds4_gpu_pp_enable_decode();
+        {
+            int ngpu_pp = ds4_gpu_pp_ngpu();
+            ds4_gpu_pp_deactivate_decode_params_all(ngpu_pp);
+        }
         if (memory_report) ds4_gpu_print_memory_report("after PP resident build");
         fprintf(stderr, "ds4: PP decode enabled\n");
     }

@@ -1936,20 +1936,52 @@ static int ds4_gpu_pp_init(void) {
     if (!ok) { g_pp_ngpu = 0; return 0; }
 
     int total_layers = 43;
-    int per_gpu = total_layers / ngpu;
-    int rem = total_layers % ngpu;
+    const char *split_env = getenv("DS4_CUDA_PP_LAYER_SPLIT");
     int il = 0;
+    if (split_env && split_env[0]) {
+        /* Custom split: comma-separated start layers, e.g. "0,5,11,17,23,29,35"
+         * Each value is the start layer for that GPU. Must have ngpu values. */
+        int custom_start[7] = {0};
+        int n_parsed = 0;
+        const char *p = split_env;
+        while (*p && n_parsed < ngpu) {
+            custom_start[n_parsed] = (int)strtol(p, NULL, 10);
+            n_parsed++;
+            while (*p && *p != ',') p++;
+            if (*p == ',') p++;
+        }
+        if (n_parsed == ngpu) {
+            for (int g = 0; g < ngpu; g++) {
+                g_pp_layer_start[g] = custom_start[g];
+                if (g + 1 < ngpu) {
+                    g_pp_layer_end[g] = custom_start[g + 1] - 1;
+                } else {
+                    g_pp_layer_end[g] = total_layers - 1;
+                }
+            }
+            fprintf(stderr, "ds4: PP custom layer split: %s\n", split_env);
+        } else {
+            fprintf(stderr, "ds4: PP_LAYER_SPLIT expected %d values, got %d; using default\n", ngpu, n_parsed);
+            split_env = NULL;
+        }
+    }
+    if (!split_env || !split_env[0]) {
+        int per_gpu = total_layers / ngpu;
+        int rem = total_layers % ngpu;
+        for (int g = 0; g < ngpu; g++) {
+            g_pp_layer_start[g] = il;
+            int n = per_gpu + (g < rem ? 1 : 0);
+            g_pp_layer_end[g] = il + n - 1;
+            il += n;
+        }
+    }
     for (int g = 0; g < ngpu; g++) {
-        g_pp_layer_start[g] = il;
-        int n = per_gpu + (g < rem ? 1 : 0);
-        g_pp_layer_end[g] = il + n - 1;
-        il += n;
         cudaSetDevice(g);
         if (cudaMalloc(&g_pp_active[g], 4 * 4096 * sizeof(float)) != cudaSuccess) {
             (void)cudaGetLastError(); ok = 0;
         }
     }
-        g_pp_topology_ready = ok;
+    g_pp_topology_ready = ok;
     if (ok) {
         for (int g = 0; g < ngpu; g++) {
             cudaSetDevice(g);
@@ -1986,8 +2018,9 @@ static int ds4_gpu_pp_init(void) {
             g_pp_resident_ready = 1;
             g_pp_decode_active = 1;
         }
+        int n0 = g_pp_layer_end[0] - g_pp_layer_start[0] + 1;
         fprintf(stderr, "ds4: PP=%d ready (%d layers/GPU, GPU0: L%d-%d%s)\n",
-                ngpu, per_gpu, g_pp_layer_start[0], g_pp_layer_end[0],
+                ngpu, n0, g_pp_layer_start[0], g_pp_layer_end[0],
                 delayed ? ", delayed resident" : "");
     }
     return ok ? 1 : 0;

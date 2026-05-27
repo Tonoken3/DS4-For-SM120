@@ -18938,6 +18938,29 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             fprintf(stderr, "ds4: PP weight cache done, %.2f GiB total\n",
                     (double)total_cached/1073741824.0);
         }
+
+        /* Cache MTP model weights on GPU 0 (or all GPUs if small enough).
+         * Without this, MTP inference falls back to transient alloc per token,
+         * which OOMs under PP because free VRAM is scarce. */
+        if (e->mtp_ready) {
+            fprintf(stderr, "ds4: Caching MTP model weights...\n");
+            ds4_gpu_pp_set_device(0);
+            uint64_t mtp_cached = 0;
+            for (uint64_t ti = 0; ti < e->mtp_model.n_tensors; ti++) {
+                const ds4_tensor *t = &e->mtp_model.tensors[ti];
+                if (t->bytes == 0) continue;
+                char label[128];
+                snprintf(label, sizeof(label), "mtp:%.*s",
+                         (int)(t->name.len > 120 ? 120 : t->name.len), t->name.ptr);
+                if (ds4_gpu_cache_model_range(e->mtp_model.map, e->mtp_model.size,
+                                              t->abs_offset, t->bytes, label)) {
+                    mtp_cached += t->bytes;
+                }
+            }
+            ds4_gpu_end_commands();
+            fprintf(stderr, "ds4: MTP weight cache done, %.2f GiB\n",
+                    (double)mtp_cached/1073741824.0);
+        }
         if (!ds4_gpu_set_model_map_range(e->model.map,
                                            e->model.size,
                                            e->model.tensor_data_pos,
@@ -18978,12 +19001,21 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                 ds4_backend_name(e->backend));
 #ifndef DS4_NO_GPU
         /* Initialize persistent MoE scratch buffer for graph-compatible
-         * transient weight loading. One layer's full expert weights. */
+         * transient weight loading. One layer's full expert weights.
+         * Use the larger of target model and MTP model (if any) so both fit. */
         const ds4_tensor *tg = e->weights.layer[0].ffn_gate_exps;
         const ds4_tensor *td = e->weights.layer[0].ffn_down_exps;
-        if (tg && td) {
-            const uint64_t grb = routed_expert_row_bytes(tg);
-            const uint64_t drb = routed_expert_row_bytes(td);
+        const ds4_tensor *mtg = e->mtp_ready ? e->mtp_weights.block.ffn_gate_exps : NULL;
+        const ds4_tensor *mtd = e->mtp_ready ? e->mtp_weights.block.ffn_down_exps : NULL;
+        if ((tg && td) || (mtg && mtd)) {
+            const ds4_tensor *use_tg = tg;
+            const ds4_tensor *use_td = td;
+            if (mtg && mtd) {
+                if (!tg || mtg->bytes > tg->bytes) use_tg = mtg;
+                if (!td || mtd->bytes > td->bytes) use_td = mtd;
+            }
+            const uint64_t grb = routed_expert_row_bytes(use_tg);
+            const uint64_t drb = routed_expert_row_bytes(use_td);
             const uint64_t geb = DS4_N_FF_EXP * grb;   /* per-expert gate bytes */
             const uint64_t deb = DS4_N_EMBD * drb;      /* per-expert down bytes */
             ds4_gpu_init_moe_scratch(

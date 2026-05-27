@@ -585,11 +585,15 @@ static uint64_t g_moe_scratch_down_bytes;
 /* Selected-expert compact scratch: 6 experts' weights (gate+up+down).
  * Allocated once, reused per layer. Replaces the full 256-expert transfer
  * with a 6-expert compact copy, reducing H2D volume from 1.7GB to ~42MB. */
-static char *g_moe_compact_gate;
-static char *g_moe_compact_up;
-static char *g_moe_compact_down;
-static int32_t *g_moe_compact_selected_dev; /* device: remapped indices 0-5 */
-static uint64_t g_moe_compact_per_expert;   /* max(gate_expert_bytes, down_expert_bytes) */
+/* Compact MoE scratch is per-device: PP decode runs each layer on a different
+ * GPU, so a single global buffer would be addressed cross-device and fault.
+ * Index by the current CUDA device id. */
+static char *g_moe_compact_gate[DS4_CUDA_MAX_DEVICES];
+static char *g_moe_compact_up[DS4_CUDA_MAX_DEVICES];
+static char *g_moe_compact_down[DS4_CUDA_MAX_DEVICES];
+static int32_t *g_moe_compact_selected_dev[DS4_CUDA_MAX_DEVICES]; /* device: remapped slot indices */
+static uint64_t g_moe_compact_per_expert[DS4_CUDA_MAX_DEVICES];   /* max(gate_expert_bytes, down_expert_bytes) */
+static uint32_t g_moe_compact_slots[DS4_CUDA_MAX_DEVICES];        /* allocated capacity in (token*expert) slots */
 
 static int cuda_ok(cudaError_t err, const char *what);
 static int cuda_decode_graph_enabled(void);
@@ -2009,8 +2013,9 @@ void ds4_gpu_init_moe_scratch(uint64_t gate_bytes, uint64_t up_bytes, uint64_t d
     if (g_moe_scratch_inited) return;
     const char *scratch_env = getenv("DS4_CUDA_MOE_PERSISTENT_SCRATCH");
     if (!scratch_env || !scratch_env[0] || scratch_env[0] == '0') return;
-    /* Limit to available VRAM: skip if total > 2 GiB */
-    if (gate_bytes + up_bytes + down_bytes > 2ull * 1073741824ull) {
+    /* Limit to available VRAM: skip if total > 6 GiB.
+     * Modern GPUs have 16+ GB; 3.5 GiB scratch for Q4K MTP is acceptable. */
+    if (gate_bytes + up_bytes + down_bytes > 6ull * 1073741824ull) {
         fprintf(stderr, "ds4: MoE scratch too large (%.2f GiB), skipping\n",
                 (double)(gate_bytes + up_bytes + down_bytes) / 1073741824.0);
         return;
@@ -2433,11 +2438,14 @@ extern "C" void ds4_gpu_cleanup(void) {
     g_moe_scratch_up_bytes = 0;
     g_moe_scratch_down_bytes = 0;
     g_moe_scratch_inited = 0;
-    if (g_moe_compact_gate) { (void)cudaFree(g_moe_compact_gate); g_moe_compact_gate = NULL; }
-    if (g_moe_compact_up)   { (void)cudaFree(g_moe_compact_up);   g_moe_compact_up = NULL; }
-    if (g_moe_compact_down) { (void)cudaFree(g_moe_compact_down); g_moe_compact_down = NULL; }
-    if (g_moe_compact_selected_dev) { (void)cudaFree(g_moe_compact_selected_dev); g_moe_compact_selected_dev = NULL; }
-    g_moe_compact_per_expert = 0;
+    for (int cd = 0; cd < DS4_CUDA_MAX_DEVICES; cd++) {
+        if (g_moe_compact_gate[cd]) { (void)cudaFree(g_moe_compact_gate[cd]); g_moe_compact_gate[cd] = NULL; }
+        if (g_moe_compact_up[cd])   { (void)cudaFree(g_moe_compact_up[cd]);   g_moe_compact_up[cd] = NULL; }
+        if (g_moe_compact_down[cd]) { (void)cudaFree(g_moe_compact_down[cd]); g_moe_compact_down[cd] = NULL; }
+        if (g_moe_compact_selected_dev[cd]) { (void)cudaFree(g_moe_compact_selected_dev[cd]); g_moe_compact_selected_dev[cd] = NULL; }
+        g_moe_compact_per_expert[cd] = 0;
+        g_moe_compact_slots[cd] = 0;
+    }
     if (g_pp_topology_ready) {
         if (g_pp_nccl_ready) {
             for (int g = 0; g < g_pp_ngpu; g++) {
@@ -11395,38 +11403,71 @@ static int routed_moe_launch(
     const char *up_w = NULL;
     const char *down_w = NULL;
     int use_compact = 0;
-    int32_t compact_remap[6];
+    /* max n_expert=6, max n_tokens=3 (MTP draft=3), so 18 slots */
+    int32_t compact_remap[18];
     uint64_t compact_exp_bytes =
         gate_expert_bytes > down_expert_bytes ? gate_expert_bytes : down_expert_bytes;
 
-    if (use_temp_weights && n_tokens == 1 && n_expert <= 6) {
-        /* Allocate compact scratch on first use */
-        const uint64_t need = (uint64_t)n_expert * compact_exp_bytes;
-        if ((!g_moe_compact_gate || g_moe_compact_per_expert < compact_exp_bytes) &&
-            n_expert > 0) {
-            if (g_moe_compact_gate) cudaFree(g_moe_compact_gate);
-            if (g_moe_compact_up)   cudaFree(g_moe_compact_up);
-            if (g_moe_compact_down) cudaFree(g_moe_compact_down);
-            if (g_moe_compact_selected_dev) cudaFree(g_moe_compact_selected_dev);
-            g_moe_compact_gate = g_moe_compact_up = g_moe_compact_down = NULL;
-            g_moe_compact_selected_dev = NULL;
-            g_moe_compact_per_expert = 0;
+    /* PP mode also benefits from compact MoE: even though weights are
+       resident-cached, the full 256-expert tensor is large and may not fit
+       in the persistent scratch buffer. Use compact copy for decode.
+       MTP draft=2/3 produces n_tokens=2/3; allow up to 3 tokens so compact
+       MoE still applies (scratch becomes 6*3=18 experts, ~121MB). Each
+       (token,expert) pair gets its own scratch slot so the batch MoE kernels
+       address per-token weights via compact_remap (slot index). */
+    int compact_dev = 0;
+    (void)cudaGetDevice(&compact_dev);
+    if (compact_dev < 0 || compact_dev >= DS4_CUDA_MAX_DEVICES) compact_dev = 0;
+    /* Use compact MoE only where it is actually needed:
+     *  - use_temp_weights: non-PP path that would otherwise alloc the full
+     *    256-expert tensor transiently (the original compact case).
+     *  - PP batch verify (n_tokens>1): the MTP suffix verify would otherwise
+     *    OOM trying to materialize the full expert tensor; compact avoids it.
+     * In PP single-token decode (n_tokens==1) the per-GPU resident weights are
+     * already on device, so we keep the resident path and skip the ~1.7 GiB/pass
+     * host->device compact copy that would otherwise dominate the decode step. */
+    const int compact_pp_batch = g_pp_decode_active && n_tokens > 1u;
+    if ((use_temp_weights || compact_pp_batch) && n_tokens <= 3 && n_expert <= 6) {
+        /* Allocate compact scratch on first use, per device. PP runs each layer
+         * on a different GPU, so each device keeps its own scratch. It is shared
+         * across all layers and both models (target + MTP) on that device, so it
+         * must be sized for the largest per-expert weight AND the largest slot
+         * count (n_expert * n_tokens) seen so far on that device. */
+        const uint32_t need_slots = n_expert * n_tokens;
+        if ((!g_moe_compact_gate[compact_dev] ||
+             g_moe_compact_per_expert[compact_dev] < compact_exp_bytes ||
+             g_moe_compact_slots[compact_dev] < need_slots) && n_expert > 0) {
+            /* Grow to the max of both dimensions seen so far to avoid
+             * reallocation thrashing when target and MTP models alternate. */
             uint64_t max_per = gate_expert_bytes > down_expert_bytes ? gate_expert_bytes : down_expert_bytes;
-            uint64_t total = (uint64_t)n_expert * max_per;
-            if (cudaMalloc(&g_moe_compact_gate, (size_t)total) == cudaSuccess &&
-                cudaMalloc(&g_moe_compact_up,   (size_t)total) == cudaSuccess &&
-                cudaMalloc(&g_moe_compact_down, (size_t)total) == cudaSuccess &&
-                cudaMalloc(&g_moe_compact_selected_dev, (size_t)n_expert * 4) == cudaSuccess) {
-                g_moe_compact_per_expert = max_per;
+            if (max_per < g_moe_compact_per_expert[compact_dev]) max_per = g_moe_compact_per_expert[compact_dev];
+            uint32_t max_slots = need_slots > g_moe_compact_slots[compact_dev] ? need_slots : g_moe_compact_slots[compact_dev];
+            if (g_moe_compact_gate[compact_dev]) cudaFree(g_moe_compact_gate[compact_dev]);
+            if (g_moe_compact_up[compact_dev])   cudaFree(g_moe_compact_up[compact_dev]);
+            if (g_moe_compact_down[compact_dev]) cudaFree(g_moe_compact_down[compact_dev]);
+            if (g_moe_compact_selected_dev[compact_dev]) cudaFree(g_moe_compact_selected_dev[compact_dev]);
+            g_moe_compact_gate[compact_dev] = g_moe_compact_up[compact_dev] = g_moe_compact_down[compact_dev] = NULL;
+            g_moe_compact_selected_dev[compact_dev] = NULL;
+            g_moe_compact_per_expert[compact_dev] = 0;
+            g_moe_compact_slots[compact_dev] = 0;
+            uint64_t total = (uint64_t)max_slots * max_per;
+            if (cudaMalloc(&g_moe_compact_gate[compact_dev], (size_t)total) == cudaSuccess &&
+                cudaMalloc(&g_moe_compact_up[compact_dev],   (size_t)total) == cudaSuccess &&
+                cudaMalloc(&g_moe_compact_down[compact_dev], (size_t)total) == cudaSuccess &&
+                cudaMalloc(&g_moe_compact_selected_dev[compact_dev], (size_t)max_slots * 4) == cudaSuccess) {
+                g_moe_compact_per_expert[compact_dev] = max_per;
+                g_moe_compact_slots[compact_dev] = max_slots;
             } else {
-                cudaFree(g_moe_compact_gate); g_moe_compact_gate = NULL;
-                cudaFree(g_moe_compact_up);   g_moe_compact_up = NULL;
-                cudaFree(g_moe_compact_down); g_moe_compact_down = NULL;
-                cudaFree(g_moe_compact_selected_dev); g_moe_compact_selected_dev = NULL;
+                cudaFree(g_moe_compact_gate[compact_dev]); g_moe_compact_gate[compact_dev] = NULL;
+                cudaFree(g_moe_compact_up[compact_dev]);   g_moe_compact_up[compact_dev] = NULL;
+                cudaFree(g_moe_compact_down[compact_dev]); g_moe_compact_down[compact_dev] = NULL;
+                cudaFree(g_moe_compact_selected_dev[compact_dev]); g_moe_compact_selected_dev[compact_dev] = NULL;
                 (void)cudaGetLastError();
             }
         }
-        if (g_moe_compact_gate && g_moe_compact_per_expert >= compact_exp_bytes) {
+        if (g_moe_compact_gate[compact_dev] &&
+            g_moe_compact_per_expert[compact_dev] >= compact_exp_bytes &&
+            g_moe_compact_slots[compact_dev] >= need_slots) {
             int capture_active = 0;
             if (g_cuda_decode_stream_created) {
                 cudaStreamCaptureStatus st;
@@ -11435,46 +11476,54 @@ static int routed_moe_launch(
             }
             if (capture_active) {
                 use_compact = 1;
-                gate_w = g_moe_compact_gate;
-                up_w   = g_moe_compact_up;
-                down_w = g_moe_compact_down;
+                gate_w = g_moe_compact_gate[compact_dev];
+                up_w   = g_moe_compact_up[compact_dev];
+                down_w = g_moe_compact_down[compact_dev];
             } else {
             /* Read selected indices from device (6 int32 = 24 bytes, fast).
              * With the graph decode stream enabled, router kernels run on a
              * non-default stream, so synchronize it before this host read. */
-            int32_t host_selected[6];
+            int32_t host_selected[18]; /* max 6 experts * 3 tokens */
             cudaStream_t decode_stream = ds4_decode_stream();
             cudaError_t ce = decode_stream
                 ? cudaStreamSynchronize(decode_stream)
                 : cudaSuccess;
             if (ce == cudaSuccess) {
                 ce = cudaMemcpy(host_selected, selected->ptr,
-                                (size_t)n_expert * 4, cudaMemcpyDeviceToHost);
+                                (size_t)n_expert * n_tokens * 4, cudaMemcpyDeviceToHost);
             }
             if (ce == cudaSuccess) {
                 use_compact = 1;
-                /* Copy each selected expert's weights to compact scratch */
-                for (uint32_t ei = 0; ei < n_expert; ei++) {
-                    int ge = host_selected[ei];
-                    if (ge < 0) ge = 0;
-                    if ((uint32_t)ge >= n_total_expert) ge = 0;
-                    uint32_t uge = (uint32_t)ge;
-                    compact_remap[ei] = (int32_t)ei; /* local index */
-                    cudaMemcpyAsync(g_moe_compact_gate + (uint64_t)ei * gate_expert_bytes,
-                                    (const char*)model_map + gate_offset + (uint64_t)uge * gate_expert_bytes,
-                                    gate_expert_bytes, cudaMemcpyHostToDevice, ds4_decode_stream());
-                    cudaMemcpyAsync(g_moe_compact_up   + (uint64_t)ei * gate_expert_bytes,
-                                    (const char*)model_map + up_offset   + (uint64_t)uge * gate_expert_bytes,
-                                    gate_expert_bytes, cudaMemcpyHostToDevice, ds4_decode_stream());
-                    cudaMemcpyAsync(g_moe_compact_down + (uint64_t)ei * down_expert_bytes,
-                                    (const char*)model_map + down_offset + (uint64_t)uge * down_expert_bytes,
-                                    down_expert_bytes, cudaMemcpyHostToDevice, ds4_decode_stream());
+                /* Copy each selected expert's weights to compact scratch per token */
+                for (uint32_t ti = 0; ti < n_tokens; ti++) {
+                    for (uint32_t ei = 0; ei < n_expert; ei++) {
+                        int ge = host_selected[ti * n_expert + ei];
+                        if (ge < 0) ge = 0;
+                        if ((uint32_t)ge >= n_total_expert) ge = 0;
+                        uint32_t uge = (uint32_t)ge;
+                        /* The batch MoE kernels read weights at
+                         * base + selected[pair]*expert_bytes and derive the
+                         * input token from pair/n_expert. Store the compact
+                         * scratch slot index (ti*n_expert+ei) here so each
+                         * (token,expert) pair reads its own copied weight. */
+                        compact_remap[ti * n_expert + ei] = (int32_t)(ti * n_expert + ei);
+                        uint64_t slot_off = ((uint64_t)ti * n_expert + ei) * gate_expert_bytes;
+                        cudaMemcpyAsync(g_moe_compact_gate[compact_dev] + slot_off,
+                                        (const char*)model_map + gate_offset + (uint64_t)uge * gate_expert_bytes,
+                                        gate_expert_bytes, cudaMemcpyHostToDevice, ds4_decode_stream());
+                        cudaMemcpyAsync(g_moe_compact_up[compact_dev]   + slot_off,
+                                        (const char*)model_map + up_offset   + (uint64_t)uge * gate_expert_bytes,
+                                        gate_expert_bytes, cudaMemcpyHostToDevice, ds4_decode_stream());
+                        cudaMemcpyAsync(g_moe_compact_down[compact_dev] + ((uint64_t)ti * n_expert + ei) * down_expert_bytes,
+                                        (const char*)model_map + down_offset + (uint64_t)uge * down_expert_bytes,
+                                        down_expert_bytes, cudaMemcpyHostToDevice, ds4_decode_stream());
+                    }
                 }
-                cudaMemcpyAsync(g_moe_compact_selected_dev, compact_remap,
-                                (size_t)n_expert * 4, cudaMemcpyHostToDevice, ds4_decode_stream());
-                gate_w = g_moe_compact_gate;
-                up_w   = g_moe_compact_up;
-                down_w = g_moe_compact_down;
+                cudaMemcpyAsync(g_moe_compact_selected_dev[compact_dev], compact_remap,
+                                (size_t)n_expert * n_tokens * 4, cudaMemcpyHostToDevice, ds4_decode_stream());
+                gate_w = g_moe_compact_gate[compact_dev];
+                up_w   = g_moe_compact_up[compact_dev];
+                down_w = g_moe_compact_down[compact_dev];
                 if (!g_moe_compact_notice_printed) {
                     fprintf(stderr, "ds4: CUDA MoE compact selected-expert copy (%u experts, %.2f MiB/layer)\n",
                             n_expert, (double)(n_expert * (gate_expert_bytes * 2 + down_expert_bytes)) / 1048576.0);
@@ -11521,7 +11570,7 @@ static int routed_moe_launch(
 
     int ok = 1;
     const int32_t *selected_ptr = use_compact
-        ? g_moe_compact_selected_dev
+        ? g_moe_compact_selected_dev[compact_dev]
         : (const int32_t *)selected->ptr;
     const uint32_t xq_blocks = expert_in_dim / CUDA_QK_K;
     const uint32_t midq_blocks = expert_mid_dim / CUDA_QK_K;

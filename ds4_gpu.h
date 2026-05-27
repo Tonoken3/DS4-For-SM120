@@ -885,10 +885,31 @@ int ds4_gpu_decode_graph_patch_post(int layer, uint32_t pos);
 /* PP (Pipeline Parallelism) export API */
 int ds4_gpu_pp_set_device(int g);
 int ds4_gpu_pp_enabled(void);
+int ds4_gpu_pp_requested(void);
+int ds4_gpu_pp_resident_ready(void);
+int ds4_gpu_pp_enable_decode(void);
 int ds4_gpu_pp_ngpu(void);
 int ds4_gpu_pp_layer_start(int g);
 int ds4_gpu_pp_layer_end(int g);
 void *ds4_gpu_pp_active_ptr(int g);
 int ds4_gpu_pp_p2p_copy(int dst_gpu, int src_gpu);
+int ds4_gpu_pp_p2p_copy_ptr(int dst_gpu, int src_gpu,
+                             void *dst_ptr, void *src_ptr,
+                             uint64_t bytes);
+
+/* Pre-reserve cache vector capacity to prevent reallocation during decode. */
+void ds4_gpu_model_range_reserve(void);
+
+/* Release all GPU weight caches for PP resident rebuild.
+ * Safe after prefill: preserves graph tensors, KV cache, scratch. */
+void ds4_gpu_release_weight_cache_for_pp(void);
+
+/* Force-cache a model tensor range on the current GPU device.
+ * Bypasses the registered-model shortcut for PP weight residency. */
+int ds4_gpu_cache_model_range_force(const void *model_map, uint64_t model_size,
+                                    uint64_t offset, uint64_t bytes, const char *label);
+
+/* Debug: print tensor pointer and device attributes */
+void ds4_gpu_debug_tensor_ptr(const char *name, ds4_gpu_tensor *t);
 
 #endif

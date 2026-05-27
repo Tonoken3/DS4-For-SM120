@@ -3,6 +3,7 @@
 #include <mma.h>
 #include <cublas_v2.h>
 #include <cub/block/block_radix_sort.cuh>
+#include <nccl.h>
 
 #include <stdint.h>
 #include <errno.h>
@@ -98,7 +99,12 @@ static void *g_cublas_workspace;
 static uint64_t g_cublas_workspace_bytes;
 
 static cudaStream_t ds4_decode_stream(void) {
-    return g_cuda_decode_stream_created ? g_cuda_decode_stream : 0;
+    if (!g_cuda_decode_stream_created) return 0;
+    /* In PP mode, only GPU 0's decode stream is valid.
+     * Other GPUs must use their default stream (0). */
+    int dev = 0;
+    if (cudaGetDevice(&dev) == cudaSuccess && dev != 0) return 0;
+    return g_cuda_decode_stream;
 }
 
 /* Phase 3: captured decode graph state */
@@ -357,6 +363,7 @@ struct cuda_model_range {
     uint64_t registered_bytes;
     int host_registered;
     int arena_allocated;
+    int device;
 };
 
 struct cuda_model_arena {
@@ -416,10 +423,15 @@ static int g_moe_compact_notice_printed;
 
 /* Pipeline Parallelism (PP) state */
 static int g_pp_ngpu;
-static int g_pp_enabled;
+static int g_pp_requested;
+static int g_pp_topology_ready;
+static int g_pp_resident_ready;
+static int g_pp_decode_active;
 static int g_pp_layer_start[7];
 static int g_pp_layer_end[7];
 static float *g_pp_active[7];
+static ncclComm_t g_pp_nccl_comms[7];
+static int g_pp_nccl_ready;
 static int g_moe_scratch_inited;
 
 /* Persistent MoE scratch: pre-allocated buffer for one layer's full expert
@@ -507,18 +519,24 @@ static int cuda_model_direct_host_access_allowed(void) {
 
 static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what) {
     if (bytes == 0) return cuda_model_ptr(model_map, offset);
-    if (g_model_device_owned || g_model_registered) return cuda_model_ptr(model_map, offset);
-    if (cuda_model_direct_host_access_allowed()) return cuda_model_ptr(model_map, offset);
 
+    /* Check per-tensor cache first. PP resident weights must override the
+     * registered-model shortcut so each GPU uses its local cached copy. */
     const uint64_t end = offset + bytes;
-    auto exact = g_model_range_by_offset.find(offset);
-    if (exact != g_model_range_by_offset.end()) {
-        const cuda_model_range &r = g_model_ranges[exact->second];
-        if (r.host_base == model_map && end >= offset && bytes <= r.bytes) return r.device_ptr;
+    int current_dev = -1;
+    (void)cudaGetDevice(&current_dev);
+    {
+        auto exact = g_model_range_by_offset.find(offset);
+        if (exact != g_model_range_by_offset.end()) {
+            const cuda_model_range &r = g_model_ranges[exact->second];
+            if (r.host_base == model_map && end >= offset && bytes <= r.bytes && r.device == current_dev) return r.device_ptr;
+        }
     }
+    const char *fallback = NULL;
     for (const cuda_model_range &r : g_model_ranges) {
         if (r.host_base == model_map && offset >= r.offset && end >= offset && end <= r.offset + r.bytes) {
-            return r.device_ptr + (offset - r.offset);
+            if (r.device == current_dev) return r.device_ptr + (offset - r.offset);
+            if (!fallback) fallback = r.device_ptr + (offset - r.offset);
         }
         if (r.host_base == model_map && r.host_registered && r.registered_base && r.registered_device_base) {
             const uintptr_t h0 = (uintptr_t)((const char *)model_map + offset);
@@ -528,6 +546,9 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
             if (h1 >= h0 && h0 >= r0 && h1 <= r1) return r.registered_device_base + (h0 - r0);
         }
     }
+    if (fallback) return fallback;
+    if (g_model_device_owned || g_model_registered) return cuda_model_ptr(model_map, offset);
+    if (cuda_model_direct_host_access_allowed()) return cuda_model_ptr(model_map, offset);
 
     if (getenv("DS4_CUDA_NO_FD_CACHE") == NULL) {
         const char *fd_ptr = cuda_model_range_ptr_from_fd(model_map, offset, bytes, what);
@@ -550,7 +571,7 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
             err = cudaHostGetDevicePointer(&reg_dev, (void *)reg_addr, 0);
             if (err == cudaSuccess && reg_dev) {
                 char *dev_ptr = (char *)reg_dev + reg_delta;
-                g_model_ranges.push_back({model_map, offset, bytes, dev_ptr, (void *)reg_addr, (char *)reg_dev, reg_bytes, 1, 0});
+                g_model_ranges.push_back({model_map, offset, bytes, dev_ptr, (void *)reg_addr, (char *)reg_dev, reg_bytes, 1, 0, -1});
                 g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
                 if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
                     fprintf(stderr, "ds4: CUDA mapped %s %.2f MiB\n",
@@ -594,7 +615,7 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
             return NULL;
         }
     }
-    g_model_ranges.push_back({model_map, offset, bytes, (char *)dev, NULL, NULL, 0, 0, 0});
+    g_model_ranges.push_back({model_map, offset, bytes, (char *)dev, NULL, NULL, 0, 0, 0, -1});
     g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
     g_model_range_bytes += bytes;
     if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
@@ -608,8 +629,10 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
 
 static int cuda_moe_temp_weights_enabled(void) {
     if (getenv("DS4_CUDA_NO_MOE_TEMP_WEIGHTS") != NULL) return 0;
-    /* PP resident mode: weights are arena-cached on each GPU, no H2D needed */
-    if (g_pp_enabled) return 0;
+    /* PP resident mode: weights are cached on each GPU, no H2D needed.
+     * But if weights are not actually cached (e.g., OOM), fall through
+     * to use compact MoE which streams from host memory. */
+    if (g_pp_decode_active) return 0;
     const char *env = getenv("DS4_CUDA_MOE_TEMP_WEIGHTS");
     if (env && env[0]) return env[0] != '0';
     if (cuda_decode_graph_enabled()) return 1;
@@ -1545,7 +1568,7 @@ static const char *cuda_model_range_ptr_from_fd(
         return NULL;
     }
 
-    g_model_ranges.push_back({model_map, offset, bytes, dev, NULL, NULL, 0, 0, 1});
+    g_model_ranges.push_back({model_map, offset, bytes, dev, NULL, NULL, 0, 0, 1, -1});
     g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
     g_model_range_bytes += bytes;
     cuda_model_load_progress_note(g_model_range_bytes);
@@ -1787,6 +1810,7 @@ void ds4_gpu_init_moe_scratch(uint64_t gate_bytes, uint64_t up_bytes, uint64_t d
 static int ds4_gpu_pp_init(void) {
     const char *pp_env = getenv("DS4_CUDA_PP");
     if (!pp_env || !pp_env[0] || pp_env[0] == '0') return 1;
+    g_pp_requested = 1;
     int ngpu = 0;
     if (cudaGetDeviceCount(&ngpu) != cudaSuccess || ngpu < 2) return 0;
     g_pp_ngpu = ngpu;
@@ -1799,9 +1823,9 @@ static int ds4_gpu_pp_init(void) {
             int can = 0;
             cudaError_t ce = cudaDeviceCanAccessPeer(&can, i, j);
             if (ce != cudaSuccess || !can) { ok = 0; continue; }
-            ce = cudaDeviceEnablePeerAccess(j, 0);
-            if (ce != cudaSuccess && ce != cudaErrorPeerAccessAlreadyEnabled)
-                ok = 0;
+            /* NOTE: cudaDeviceEnablePeerAccess BROKEN on Blackwell CUDA 13.2.
+             * cudaMemcpyPeer works automatically without explicit enable. */
+            (void)ce;
         }
     }
     if (!ok) { g_pp_ngpu = 0; return 0; }
@@ -1820,11 +1844,28 @@ static int ds4_gpu_pp_init(void) {
             (void)cudaGetLastError(); ok = 0;
         }
     }
-    g_pp_enabled = ok;
+    g_pp_topology_ready = ok;
+    if (ok && getenv("DS4_CUDA_PP_NCCL") != NULL) {
+        ncclResult_t nr = ncclCommInitAll(g_pp_nccl_comms, ngpu, NULL);
+        if (nr == ncclSuccess) {
+            g_pp_nccl_ready = 1;
+            fprintf(stderr, "ds4: NCCL PP communicator ready (%d GPUs)\n", ngpu);
+        } else {
+            fprintf(stderr, "ds4: ncclCommInitAll failed: %s\n", ncclGetErrorString(nr));
+        }
+        cudaSetDevice(0);
+    }
     cudaSetDevice(0);
-    if (g_pp_enabled)
-        fprintf(stderr, "ds4: PP=%d ready (%d layers/GPU, GPU0: L%d-%d)\n",
-                ngpu, per_gpu, g_pp_layer_start[0], g_pp_layer_end[0]);
+    if (ok) {
+        const int delayed = getenv("DS4_CUDA_PP_DELAY_RESIDENT") != NULL;
+        if (!delayed) {
+            g_pp_resident_ready = 1;
+            g_pp_decode_active = 1;
+        }
+        fprintf(stderr, "ds4: PP=%d ready (%d layers/GPU, GPU0: L%d-%d%s)\n",
+                ngpu, per_gpu, g_pp_layer_start[0], g_pp_layer_end[0],
+                delayed ? ", delayed resident" : "");
+    }
     return ok ? 1 : 0;
 }
 
@@ -1832,7 +1873,14 @@ static int ds4_gpu_pp_init(void) {
 extern "C" int ds4_gpu_pp_set_device(int g) {
     cudaSetDevice(g); return 1;
 }
-extern "C" int ds4_gpu_pp_enabled(void) { return g_pp_enabled; }
+extern "C" int ds4_gpu_pp_enabled(void) { return g_pp_decode_active; }
+extern "C" int ds4_gpu_pp_requested(void) { return g_pp_requested; }
+extern "C" int ds4_gpu_pp_resident_ready(void) { return g_pp_resident_ready; }
+extern "C" int ds4_gpu_pp_enable_decode(void) {
+    g_pp_resident_ready = 1;
+    g_pp_decode_active = 1;
+    return 1;
+}
 extern "C" int ds4_gpu_pp_ngpu(void) { return g_pp_ngpu; }
 extern "C" int ds4_gpu_pp_layer_start(int g) { return (g >= 0 && g < g_pp_ngpu) ? g_pp_layer_start[g] : -1; }
 extern "C" int ds4_gpu_pp_layer_end(int g) { return (g >= 0 && g < g_pp_ngpu) ? g_pp_layer_end[g] : -1; }
@@ -1843,6 +1891,77 @@ extern "C" int ds4_gpu_pp_p2p_copy(int dst_gpu, int src_gpu) {
                                      g_pp_active[src_gpu], src_gpu,
                                      4 * 4096 * sizeof(float));
     return ce == cudaSuccess ? 1 : 0;
+}
+
+extern "C" int ds4_gpu_pp_p2p_copy_ptr(int dst_gpu, int src_gpu,
+                                         void *dst_ptr, void *src_ptr,
+                                         uint64_t bytes) {
+    if (!dst_ptr || !src_ptr || bytes == 0) return 0;
+    if (g_pp_nccl_ready && src_gpu >= 0 && src_gpu < g_pp_ngpu && dst_gpu >= 0 && dst_gpu < g_pp_ngpu) {
+        ncclResult_t nr = ncclGroupStart();
+        size_t count = bytes / sizeof(float);
+        if (nr == ncclSuccess) nr = ncclSend(src_ptr, count, ncclFloat, dst_gpu, g_pp_nccl_comms[src_gpu], cudaStreamDefault);
+        if (nr == ncclSuccess) nr = ncclRecv(dst_ptr, count, ncclFloat, src_gpu, g_pp_nccl_comms[src_gpu], cudaStreamDefault);
+        if (nr == ncclSuccess) nr = ncclGroupEnd();
+        if (nr == ncclSuccess) {
+            cudaSetDevice(src_gpu);
+            cudaError_t ce = cudaStreamSynchronize(cudaStreamDefault);
+            if (ce == cudaSuccess) return 1;
+            fprintf(stderr, "ds4: NCCL P2P copy stream sync failed: %s\n", cudaGetErrorString(ce));
+        } else {
+            fprintf(stderr, "ds4: NCCL P2P copy failed: %s, falling back to cudaMemcpyPeer\n", ncclGetErrorString(nr));
+        }
+    }
+    cudaError_t ce = cudaMemcpyPeer(dst_ptr, dst_gpu, src_ptr, src_gpu, (size_t)bytes);
+    return ce == cudaSuccess ? 1 : 0;
+}
+
+extern "C" void ds4_gpu_model_range_reserve(void) {
+    g_model_ranges.reserve(g_model_ranges.size() + 1024);
+    g_q8_f16_ranges.reserve(g_q8_f16_ranges.size() + 1024);
+    g_q8_f32_ranges.reserve(g_q8_f32_ranges.size() + 1024);
+}
+
+extern "C" void ds4_gpu_release_weight_cache_for_pp(void) {
+    cuda_model_range_release_all();
+    cuda_q8_f16_cache_release_all();
+    for (const cuda_q8_f32_range &r : g_q8_f32_ranges) {
+        (void)cudaFree(r.device_ptr);
+    }
+    g_q8_f32_ranges.clear();
+    g_q8_f32_by_offset.clear();
+    g_q8_f32_bytes = 0;
+}
+
+extern "C" int ds4_gpu_cache_model_range_force(
+        const void *model_map, uint64_t model_size,
+        uint64_t offset, uint64_t bytes, const char *label) {
+    if (!model_map || bytes == 0) return 1;
+    if (offset > model_size || bytes > model_size - offset) return 0;
+    void *dev = NULL;
+    cudaError_t err = cudaMalloc(&dev, (size_t)bytes);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        fprintf(stderr, "ds4: CUDA force-cache alloc failed for %s (%.2f MiB): %s\n",
+                label ? label : "pp_weight", (double)bytes / 1048576.0,
+                cudaGetErrorString(err));
+        return 0;
+    }
+    const char *src = (const char *)model_map + offset;
+    err = cudaMemcpy(dev, src, (size_t)bytes, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "ds4: CUDA force-cache copy failed for %s: %s\n",
+                label ? label : "pp_weight", cudaGetErrorString(err));
+        (void)cudaFree(dev);
+        (void)cudaGetLastError();
+        return 0;
+    }
+    int current_dev = -1;
+    (void)cudaGetDevice(&current_dev);
+    g_model_ranges.push_back({model_map, offset, bytes, (char *)dev, NULL, NULL, 0, 0, 0, current_dev});
+    g_model_range_by_offset[offset] = g_model_ranges.size() - 1;
+    g_model_range_bytes += bytes;
+    return 1;
 }
 
 extern "C" void ds4_gpu_cleanup(void) {
@@ -1943,7 +2062,16 @@ extern "C" void ds4_gpu_cleanup(void) {
     if (g_moe_compact_down) { (void)cudaFree(g_moe_compact_down); g_moe_compact_down = NULL; }
     if (g_moe_compact_selected_dev) { (void)cudaFree(g_moe_compact_selected_dev); g_moe_compact_selected_dev = NULL; }
     g_moe_compact_per_expert = 0;
-    if (g_pp_enabled) {
+    if (g_pp_topology_ready) {
+        if (g_pp_nccl_ready) {
+            for (int g = 0; g < g_pp_ngpu; g++) {
+                if (g_pp_nccl_comms[g]) {
+                    ncclCommDestroy(g_pp_nccl_comms[g]);
+                    g_pp_nccl_comms[g] = NULL;
+                }
+            }
+            g_pp_nccl_ready = 0;
+        }
         for (int g = 0; g < g_pp_ngpu; g++) {
             cudaSetDevice(g);
             (void)cudaFree(g_pp_active[g]);
@@ -1952,7 +2080,10 @@ extern "C" void ds4_gpu_cleanup(void) {
         memset(g_pp_layer_start, 0, sizeof(g_pp_layer_start));
         memset(g_pp_layer_end, 0, sizeof(g_pp_layer_end));
         g_pp_ngpu = 0;
-        g_pp_enabled = 0;
+        g_pp_topology_ready = 0;
+        g_pp_decode_active = 0;
+        g_pp_resident_ready = 0;
+        g_pp_requested = 0;
     }
 }
 
@@ -1982,6 +2113,18 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes) {
     t->bytes = bytes;
     t->owner = 1;
     return t;
+}
+
+extern "C" void ds4_gpu_debug_tensor_ptr(const char *name, ds4_gpu_tensor *t) {
+    if (!t) { fprintf(stderr, "ds4: %s is NULL\n", name); return; }
+    cudaPointerAttributes attr;
+    cudaError_t err = cudaPointerGetAttributes(&attr, t->ptr);
+    if (err == cudaSuccess) {
+        fprintf(stderr, "ds4: %s ptr=%p device=%d type=%d bytes=%lu\n",
+                name, t->ptr, attr.device, (int)attr.type, (unsigned long)t->bytes);
+    } else {
+        fprintf(stderr, "ds4: %s ptr=%p attr failed: %s\n", name, t->ptr, cudaGetErrorString(err));
+    }
 }
 
 static uint64_t cuda_managed_kv_reserve_bytes(uint64_t total_bytes) {

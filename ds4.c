@@ -8841,6 +8841,24 @@ typedef struct {
     uint64_t                 cuda_params_bytes;
 } ds4_gpu_graph;
 
+/* Per-GPU graph state for PP (Pipeline Parallelism) decode.
+ * Each GPU has its own activation tensors AND KV caches on its local memory.
+ * No P2P kernel access needed — only cudaMemcpyPeer for activation transfers. */
+typedef struct {
+    ds4_gpu_graph g;
+    int device;
+    int layer_start;
+    int layer_end;
+} ds4_pp_gpu;
+
+static bool metal_graph_alloc_pp(ds4_pp_gpu *pp, int ngpu, const ds4_model *model,
+                                 const ds4_weights *weights,
+                                 const ds4_gpu_graph *ref);
+static void metal_graph_free_pp(ds4_pp_gpu *pp, int ngpu);
+
+static ds4_pp_gpu *g_pp_graphs;
+static int g_pp_graphs_ngpu;
+
 static bool graph_power_throttle_enabled(const ds4_gpu_graph *g) {
     return g && g->power_percent > 0 && g->power_percent < 100;
 }
@@ -9016,6 +9034,176 @@ static void metal_graph_free(ds4_gpu_graph *g) {
     g->cuda_params_dev = NULL;
     g->cuda_params_bytes = 0;
     memset(g, 0, sizeof(*g));
+}
+
+/* Allocate per-GPU activation + KV cache tensors for PP decode.
+ * EVERY tensor is local to its GPU — no P2P kernel access needed.
+ * P2P is used only for cudaMemcpyPeer activation transfers between GPUs. */
+static bool metal_graph_alloc_pp(ds4_pp_gpu *pp, int ngpu, const ds4_model *model,
+                                 const ds4_weights *weights,
+                                 const ds4_gpu_graph *ref) {
+    (void)model; (void)weights;
+    if (!pp || ngpu < 2 || !ref) return false;
+
+    /* For each tensor field in ds4_gpu_graph, if ref has it allocated,
+     * allocate a same-sized copy on the target GPU. */
+    for (int gp = 0; gp < ngpu; gp++) {
+        ds4_pp_gpu *pg = &pp[gp];
+        memset(&pg->g, 0, sizeof(pg->g));
+        pg->device = gp;
+        pg->layer_start = ds4_gpu_pp_layer_start(gp);
+        pg->layer_end = ds4_gpu_pp_layer_end(gp);
+        if (pg->layer_start < 0) { metal_graph_free_pp(pp, ngpu); return false; }
+
+        ds4_gpu_pp_set_device(gp);
+        ds4_gpu_graph *g = &pg->g;
+
+        /* Copy scalar state */
+        g->raw_cap = ref->raw_cap;
+        g->raw_window = ref->raw_window;
+        g->comp_cap = ref->comp_cap;
+        g->attn_comp_stage_cap = ref->attn_comp_stage_cap;
+        g->quality = ref->quality;
+        g->power_percent = ref->power_percent;
+        g->prefill_cap = 0;
+        g->mtp_enabled = false;
+        memcpy(g->layer_comp_cap, ref->layer_comp_cap, sizeof(g->layer_comp_cap));
+        memcpy(g->layer_n_comp, ref->layer_n_comp, sizeof(g->layer_n_comp));
+        memcpy(g->layer_n_index_comp, ref->layer_n_index_comp, sizeof(g->layer_n_index_comp));
+
+        /* Activation tensors — same sizes as reference, allocated locally */
+#define PP_ALLOC_TENSOR(field) do { \
+    if (ref->field) { \
+        uint64_t _b = ds4_gpu_tensor_bytes(ref->field); \
+        if (!(g->field = ds4_gpu_tensor_alloc(_b))) { goto fail; } \
+    } } while(0)
+
+        PP_ALLOC_TENSOR(cur_hc);
+        PP_ALLOC_TENSOR(flat_hc);
+        PP_ALLOC_TENSOR(hc_mix);
+        PP_ALLOC_TENSOR(hc_split);
+        PP_ALLOC_TENSOR(hc_comb);
+        PP_ALLOC_TENSOR(attn_cur);
+        PP_ALLOC_TENSOR(attn_norm);
+        PP_ALLOC_TENSOR(qr);
+        PP_ALLOC_TENSOR(qr_norm);
+        PP_ALLOC_TENSOR(q);
+        PP_ALLOC_TENSOR(kv_raw);
+        PP_ALLOC_TENSOR(kv);
+        PP_ALLOC_TENSOR(comp_kv_cur);
+        PP_ALLOC_TENSOR(comp_sc_cur);
+        PP_ALLOC_TENSOR(attn_comp_stage);
+        PP_ALLOC_TENSOR(indexer_q);
+        PP_ALLOC_TENSOR(indexer_weights);
+        PP_ALLOC_TENSOR(indexer_scores);
+        PP_ALLOC_TENSOR(comp_mask);
+        PP_ALLOC_TENSOR(comp_selected);
+        PP_ALLOC_TENSOR(heads);
+        PP_ALLOC_TENSOR(attn_low);
+        PP_ALLOC_TENSOR(attn_out);
+        PP_ALLOC_TENSOR(after_attn_hc);
+        PP_ALLOC_TENSOR(ffn_cur);
+        PP_ALLOC_TENSOR(ffn_norm);
+        PP_ALLOC_TENSOR(shared_gate);
+        PP_ALLOC_TENSOR(shared_up);
+        PP_ALLOC_TENSOR(shared_mid);
+        PP_ALLOC_TENSOR(shared_out);
+        PP_ALLOC_TENSOR(router_logits);
+        PP_ALLOC_TENSOR(router_probs);
+        PP_ALLOC_TENSOR(router_selected);
+        PP_ALLOC_TENSOR(router_weights);
+        PP_ALLOC_TENSOR(routed_gate);
+        PP_ALLOC_TENSOR(routed_up);
+        PP_ALLOC_TENSOR(routed_mid);
+        PP_ALLOC_TENSOR(routed_down);
+        PP_ALLOC_TENSOR(routed_out);
+        PP_ALLOC_TENSOR(ffn_out);
+        PP_ALLOC_TENSOR(after_ffn_hc);
+
+        /* hc_pre/hc_post are views of hc_split: offset = DS4_N_HC * sizeof(float) for post */
+        if (ref->hc_pre && g->hc_split) {
+            g->hc_pre = ds4_gpu_tensor_view(g->hc_split, 0, ds4_gpu_tensor_bytes(ref->hc_pre));
+        }
+        if (ref->hc_post && g->hc_split) {
+            g->hc_post = ds4_gpu_tensor_view(g->hc_split,
+                (uint64_t)DS4_N_HC * sizeof(float), ds4_gpu_tensor_bytes(ref->hc_post));
+        }
+
+        /* GPU 0 gets output head tensors (logits, etc.). Others skip them. */
+        if (gp == 0) {
+            PP_ALLOC_TENSOR(output_pre);
+            PP_ALLOC_TENSOR(output_weights);
+            PP_ALLOC_TENSOR(output_embd);
+            PP_ALLOC_TENSOR(output_norm);
+            PP_ALLOC_TENSOR(logits);
+        }
+
+        /* KV caches: allocate local copies for assigned layers.
+         * P2P kernel reads are broken on Blackwell+driver 595.71.05.
+         * Each GPU must have its own layer KV caches in local memory. */
+        for (int il = pg->layer_start; il <= pg->layer_end; il++) {
+            if (ref->layer_raw_cache[il]) {
+                uint64_t b = ds4_gpu_tensor_bytes(ref->layer_raw_cache[il]);
+                g->layer_raw_cache[il] = ds4_gpu_tensor_alloc(b);
+                if (!g->layer_raw_cache[il]) goto fail;
+            }
+            if (ref->layer_attn_comp_cache[il]) {
+                uint64_t b = ds4_gpu_tensor_bytes(ref->layer_attn_comp_cache[il]);
+                g->layer_attn_comp_cache[il] = ds4_gpu_tensor_alloc(b);
+                if (!g->layer_attn_comp_cache[il]) goto fail;
+            }
+            if (ref->layer_attn_state_kv[il]) {
+                uint64_t b = ds4_gpu_tensor_bytes(ref->layer_attn_state_kv[il]);
+                g->layer_attn_state_kv[il] = ds4_gpu_tensor_alloc(b);
+                if (!g->layer_attn_state_kv[il]) goto fail;
+            }
+            if (ref->layer_attn_state_score[il]) {
+                uint64_t b = ds4_gpu_tensor_bytes(ref->layer_attn_state_score[il]);
+                g->layer_attn_state_score[il] = ds4_gpu_tensor_alloc(b);
+                if (!g->layer_attn_state_score[il]) goto fail;
+            }
+            if (ref->layer_index_comp_cache[il]) {
+                uint64_t b = ds4_gpu_tensor_bytes(ref->layer_index_comp_cache[il]);
+                g->layer_index_comp_cache[il] = ds4_gpu_tensor_alloc(b);
+                if (!g->layer_index_comp_cache[il]) goto fail;
+            }
+            if (ref->layer_index_state_kv[il]) {
+                uint64_t b = ds4_gpu_tensor_bytes(ref->layer_index_state_kv[il]);
+                g->layer_index_state_kv[il] = ds4_gpu_tensor_alloc(b);
+                if (!g->layer_index_state_kv[il]) goto fail;
+            }
+            if (ref->layer_index_state_score[il]) {
+                uint64_t b = ds4_gpu_tensor_bytes(ref->layer_index_state_score[il]);
+                g->layer_index_state_score[il] = ds4_gpu_tensor_alloc(b);
+                if (!g->layer_index_state_score[il]) goto fail;
+            }
+        }
+
+#undef PP_ALLOC_TENSOR
+
+        ds4_gpu_synchronize();
+        fprintf(stderr, "ds4: PP GPU %d graph allocated (layers %d-%d)\n",
+                gp, pg->layer_start, pg->layer_end);
+    }
+    ds4_gpu_pp_set_device(0);
+    return true;
+
+fail:
+    fprintf(stderr, "ds4: PP GPU graph allocation failed\n");
+    ds4_gpu_pp_set_device(0);
+    metal_graph_free_pp(pp, ngpu);
+    return false;
+}
+
+static void metal_graph_free_pp(ds4_pp_gpu *pp, int ngpu) {
+    if (!pp) return;
+    for (int gp = 0; gp < ngpu; gp++) {
+        if (!pp[gp].g.cur_hc && !pp[gp].g.after_ffn_hc) continue;
+        ds4_gpu_pp_set_device(pp[gp].device);
+        metal_graph_free(&pp[gp].g);
+    }
+    ds4_gpu_pp_set_device(0);
+    memset(pp, 0, (size_t)ngpu * sizeof(pp[0]));
 }
 
 static bool metal_tensor_fill_f32(ds4_gpu_tensor *t, float v, uint64_t n) {
@@ -11699,6 +11887,73 @@ static bool metal_graph_encode_token_raw_swa(
     return ok;
 }
 
+static bool metal_graph_encode_token_raw_swa_pp(
+        ds4_pp_gpu *pp, int ngpu,
+        const ds4_model *model,
+        const ds4_weights *weights,
+        int token,
+        uint32_t pos,
+        bool need_logits) {
+    ds4_gpu_graph *g0 = &pp[0].g;
+    if (g0->raw_cap == 0) {
+        fprintf(stderr, "ds4: PP raw KV cache is not allocated\n");
+        return false;
+    }
+    const uint32_t raw_row = pos % g0->raw_cap;
+    const uint32_t n_raw = metal_graph_raw_span_for_batch(g0, pos, 1);
+
+    ds4_gpu_pp_set_device(0);
+    ds4_gpu_debug_tensor_ptr("g0->cur_hc", g0->cur_hc);
+    ds4_gpu_debug_tensor_ptr("g0->flat_hc", g0->flat_hc);
+    bool ok = ds4_gpu_embed_token_hc_tensor(g0->cur_hc,
+                                              model->map,
+                                              model->size,
+                                              weights->token_embd->abs_offset,
+                                              (uint32_t)weights->token_embd->dim[1],
+                                              (uint32_t)token,
+                                              DS4_N_EMBD,
+                                              DS4_N_HC) != 0;
+    if (ok) ok = ds4_gpu_synchronize() != 0;
+    if (!ok) fprintf(stderr, "ds4: PP embed token failed\n");
+
+    for (int gp = 0; ok && gp < ngpu; gp++) {
+        ds4_gpu_pp_set_device(gp);
+        ds4_gpu_graph *gg = &pp[gp].g;
+        for (int il = pp[gp].layer_start; ok && il <= pp[gp].layer_end; il++) {
+            ok = metal_graph_encode_decode_layer(gg,
+                                                 model,
+                                                 &weights->layer[il],
+                                                 (uint32_t)il,
+                                                 pos,
+                                                 gg->layer_raw_cache[il],
+                                                 gg->raw_cap,
+                                                 raw_row,
+                                                 n_raw,
+                                                 token, false, 0);
+            ds4_gpu_tensor *tmp = gg->cur_hc;
+            gg->cur_hc = gg->after_ffn_hc;
+            gg->after_ffn_hc = tmp;
+        }
+        if (ok && gp + 1 < ngpu) {
+            ds4_gpu_pp_p2p_copy_ptr(gp + 1, gp,
+                ds4_gpu_tensor_contents(pp[gp + 1].g.cur_hc),
+                ds4_gpu_tensor_contents(gg->after_ffn_hc),
+                ds4_gpu_tensor_bytes(gg->after_ffn_hc));
+        }
+    }
+
+    if (ok && need_logits) {
+        int last = ngpu - 1;
+        ds4_gpu_pp_p2p_copy_ptr(0, last,
+            ds4_gpu_tensor_contents(g0->cur_hc),
+            ds4_gpu_tensor_contents(pp[last].g.after_ffn_hc),
+            ds4_gpu_tensor_bytes(pp[last].g.after_ffn_hc));
+        ds4_gpu_pp_set_device(0);
+        ok = metal_graph_encode_output_head(g0, model, weights, weights->output->dim[1]);
+    }
+    return ok;
+}
+
 static ds4_gpu_tensor *metal_graph_tensor_row_view(
         ds4_gpu_tensor *base,
         uint32_t          row,
@@ -13692,33 +13947,10 @@ static bool metal_graph_eval_token_raw_swa(
     bool ok = ds4_gpu_begin_commands() != 0;
     double t_encoded = (profile || throttle) ? now_sec() : 0.0;
 
-    /* PP decode: each GPU processes its assigned layers */
+    /* PP decode: per-GPU layer encode with local KV caches and P2P activation transfers */
     if (pp_mode && ok) {
-        int ngpu = ds4_gpu_pp_ngpu();
-        for (int gp = 0; gp < ngpu; gp++) {
-            int l0 = ds4_gpu_pp_layer_start(gp);
-            int l1 = ds4_gpu_pp_layer_end(gp);
-            if (l0 < 0 || l1 < 0) { ok = false; break; }
-
-            if (gp > 0) {
-                /* Copy activation from previous GPU */
-                if (!ds4_gpu_pp_p2p_copy(gp, gp - 1)) { ok = false; break; }
-            }
-
-            /* Encode assigned layers (weights pre-cached on this GPU) */
-            ds4_gpu_pp_set_device(gp);
-            for (int il = l0; il <= l1 && ok; il++) {
-                const ds4_layer_weights *layer = &weights->layer[il];
-                uint32_t raw_row = pos % g->raw_cap;
-                uint32_t n_raw = pos + 1;
-                if (n_raw > g->raw_window) n_raw = g->raw_window;
-                if (n_raw > g->raw_cap) n_raw = g->raw_cap;
-                ok = metal_graph_encode_decode_layer(g, model, layer, (uint32_t)il,
-                         pos, g->layer_raw_cache[il], g->raw_cap,
-                         raw_row, n_raw, token, false, 0);
-            }
-        }
-        ds4_gpu_pp_set_device(0);
+        ok = metal_graph_encode_token_raw_swa_pp(g_pp_graphs, g_pp_graphs_ngpu,
+                                                  model, weights, token, pos, logits != NULL);
         if (profile) t_encoded = now_sec();
     } else {
         const int subgraphs_ready =
@@ -16535,6 +16767,96 @@ static int generate_metal_graph_raw_swa(
         fprintf(stderr, "ds4: wrote GPU prefill logits to %s\n", dump_prefill_logits);
     }
 
+    /* Phase 1: delayed PP resident cache construction.
+     * P2P kernel reads are broken on Blackwell+driver 595.71.05.
+     * Weights + KV caches are distributed across all 7 GPUs (per-GPU local).
+     * Only activation transfers use cudaMemcpyPeer (which works). */
+    if (ds4_gpu_pp_requested() && !ds4_gpu_pp_resident_ready()) {
+        fprintf(stderr, "ds4: PP delayed resident: releasing prefill caches, building PP weights...\n");
+        ds4_gpu_synchronize();
+        ds4_gpu_release_weight_cache_for_pp();
+        if (memory_report) ds4_gpu_print_memory_report("after cache release");
+        {   /* Distribute weights across all GPUs (per assigned layers) */
+            int ngpu = ds4_gpu_pp_ngpu();
+            uint64_t total_cached = 0;
+            for (int g = 0; g < ngpu; g++) {
+                ds4_gpu_pp_set_device(g);
+                int l0 = ds4_gpu_pp_layer_start(g);
+                int l1 = ds4_gpu_pp_layer_end(g);
+                if (l0 < 0) continue;
+                for (uint64_t ti = 0; ti < model->n_tensors; ti++) {
+                    const ds4_tensor *t = &model->tensors[ti];
+                    if (t->bytes == 0) continue;
+                    int bl = -1;
+                    if (t->name.len > 4 && memcmp(t->name.ptr, "blk.", 4) == 0) {
+                        uint64_t pos2 = 4;
+                        while (pos2 < t->name.len && t->name.ptr[pos2] >= '0' && t->name.ptr[pos2] <= '9') {
+                            bl = (bl < 0 ? 0 : bl * 10) + (t->name.ptr[pos2] - '0');
+                            pos2++;
+                        }
+                    }
+                    if (bl < 0 && g != 0) continue;
+                    if (bl >= 0 && (bl < l0 || bl > l1)) continue;
+                    char label[128];
+                    snprintf(label, sizeof(label), "pp:%.*s", (int)(t->name.len > 120 ? 120 : t->name.len), t->name.ptr);
+                    if (ds4_gpu_cache_model_range_force(model->map, model->size,
+                                                        t->abs_offset, t->bytes, label)) {
+                        total_cached += t->bytes;
+                    }
+                }
+        ds4_gpu_end_commands();
+        fprintf(stderr, "ds4: PP GPU %d: layers %d-%d cached\n", g, l0, l1);
+    }
+    ds4_gpu_pp_set_device(0);
+    fprintf(stderr, "ds4: PP weight cache done, %.2f GiB total\n",
+            (double)total_cached / 1073741824.0);
+    ds4_gpu_model_range_reserve();
+        }
+        ds4_gpu_pp_enable_decode();
+        if (memory_report) ds4_gpu_print_memory_report("after PP resident build");
+        fprintf(stderr, "ds4: PP decode enabled\n");
+    }
+
+    /* Allocate per-GPU activation + KV cache tensors for PP decode */
+    g_pp_graphs = NULL;
+    g_pp_graphs_ngpu = 0;
+    if (ds4_gpu_pp_enabled()) {
+        int ngpu = ds4_gpu_pp_ngpu();
+        if (ngpu > 0) {
+            g_pp_graphs = (ds4_pp_gpu *)calloc((size_t)ngpu, sizeof(ds4_pp_gpu));
+            if (!g_pp_graphs) { free(logits); metal_graph_free(&g); return 1; }
+            if (!metal_graph_alloc_pp(g_pp_graphs, ngpu, model, weights, &g)) {
+                free(g_pp_graphs); g_pp_graphs = NULL;
+                free(logits); metal_graph_free(&g); return 1;
+            }
+            g_pp_graphs_ngpu = ngpu;
+            /* Copy KV caches from GPU 0 to each PP GPU */
+            for (int gp = 0; gp < ngpu; gp++) {
+                ds4_pp_gpu *pg = &g_pp_graphs[gp];
+                for (int il = pg->layer_start; il <= pg->layer_end; il++) {
+#define PP_COPY_KV(field) do { \
+    if (g.field[il] && pg->g.field[il]) { \
+        ds4_gpu_pp_p2p_copy_ptr(gp, 0, \
+            ds4_gpu_tensor_contents(pg->g.field[il]), \
+            ds4_gpu_tensor_contents(g.field[il]), \
+            ds4_gpu_tensor_bytes(g.field[il])); \
+    } } while(0)
+                    PP_COPY_KV(layer_raw_cache);
+                    PP_COPY_KV(layer_attn_comp_cache);
+                    PP_COPY_KV(layer_attn_state_kv);
+                    PP_COPY_KV(layer_attn_state_score);
+                    PP_COPY_KV(layer_index_comp_cache);
+                    PP_COPY_KV(layer_index_state_kv);
+                    PP_COPY_KV(layer_index_state_score);
+#undef PP_COPY_KV
+                }
+            }
+            ds4_gpu_synchronize();
+            fprintf(stderr, "ds4: PP KV cache copy done\n");
+            if (memory_report) ds4_gpu_print_memory_report("after PP graph alloc");
+        }
+    }
+
     int pos = prompt->len;
     int n_generated = 0;
     int n_decode_eval = 0;
@@ -16584,6 +16906,12 @@ static int generate_metal_graph_raw_swa(
             decode_s > 0.0 ? (double)n_generated / decode_s : 0.0);
 
     if (memory_report) ds4_gpu_print_memory_report("before graph free");
+    if (g_pp_graphs) {
+        metal_graph_free_pp(g_pp_graphs, g_pp_graphs_ngpu);
+        free(g_pp_graphs);
+        g_pp_graphs = NULL;
+        g_pp_graphs_ngpu = 0;
+    }
     free(logits);
     metal_graph_free(&g);
     return ok ? 0 : 1;

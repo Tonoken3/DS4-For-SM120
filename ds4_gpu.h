@@ -867,8 +867,8 @@ int ds4_gpu_decode_graph_capture(void);          /* begin capture */
 int ds4_gpu_decode_graph_capture_end(void);       /* end capture + instantiate */
 int ds4_gpu_decode_graph_launch(void);            /* replay captured graph */
 int ds4_gpu_decode_graph_captured(void);          /* 1 if ready for replay */
-int ds4_gpu_decode_graph_capture_end_store(int layer);
-int ds4_gpu_decode_subgraph_launch(int layer);
+int ds4_gpu_decode_graph_capture_end_store(int part, int layer);
+int ds4_gpu_decode_subgraph_launch(int part, int layer);
 int ds4_gpu_decode_subgraphs_ready(void);
 
 /* PP (Pipeline Parallelism) export API */

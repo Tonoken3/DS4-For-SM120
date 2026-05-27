@@ -13657,6 +13657,7 @@ static bool metal_graph_eval_token_raw_swa(
     const bool throttle = graph_power_throttle_enabled(g);
     const double t0 = (profile || throttle) ? now_sec() : 0.0;
     const bool graph_mode = getenv("DS4_CUDA_DECODE_GRAPH") != NULL;
+    const bool pp_mode = ds4_gpu_pp_enabled();
     const bool graph_capture_mode = graph_mode && g->cuda_params_host &&
                                     ds4_gpu_decode_graph_can_capture() != 0;
 
@@ -13679,6 +13680,37 @@ static bool metal_graph_eval_token_raw_swa(
 
     bool ok = ds4_gpu_begin_commands() != 0;
     double t_encoded = (profile || throttle) ? now_sec() : 0.0;
+
+    /* PP decode: each GPU processes its assigned layers */
+    if (pp_mode && ok) {
+        int ngpu = ds4_gpu_pp_ngpu();
+        for (int gp = 0; gp < ngpu; gp++) {
+            int l0 = ds4_gpu_pp_layer_start(gp);
+            int l1 = ds4_gpu_pp_layer_end(gp);
+            if (l0 < 0 || l1 < 0) { ok = false; break; }
+
+            if (gp > 0) {
+                /* Copy activation from previous GPU */
+                if (!ds4_gpu_pp_p2p_copy(gp, gp - 1)) { ok = false; break; }
+            }
+
+            /* Encode assigned layers (weights pre-cached on this GPU) */
+            ds4_gpu_pp_set_device(gp);
+            for (int il = l0; il <= l1 && ok; il++) {
+                const ds4_layer_weights *layer = &weights->layer[il];
+                uint32_t raw_row = pos % g->raw_cap;
+                uint32_t n_raw = pos + 1;
+                if (n_raw > g->raw_window) n_raw = g->raw_window;
+                if (n_raw > g->raw_cap) n_raw = g->raw_cap;
+                ok = metal_graph_encode_decode_layer(g, model, layer, (uint32_t)il,
+                         pos, g->layer_raw_cache[il], g->raw_cap,
+                         raw_row, n_raw, token);
+            }
+        }
+        ds4_gpu_pp_set_device(0);
+        if (profile) t_encoded = now_sec();
+    } else {
+
 
     if (graph_capture_mode && ds4_gpu_decode_graph_captured()) {
         double r0 = profile ? now_sec() : 0.0;
@@ -13706,6 +13738,8 @@ static bool metal_graph_eval_token_raw_swa(
                                                       token, pos, logits != NULL, true);
         if (profile) t_encoded = now_sec();
     }
+
+    } /* end pp_mode else */
 
     if (ok) ok = ds4_gpu_end_commands() != 0;
     const double t_done = (profile || throttle) ? now_sec() : 0.0;

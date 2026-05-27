@@ -1741,6 +1741,23 @@ static int ds4_gpu_pp_init(void) {
     return ok ? 1 : 0;
 }
 
+/* PP export API */
+extern "C" int ds4_gpu_pp_set_device(int g) {
+    cudaSetDevice(g); return 1;
+}
+extern "C" int ds4_gpu_pp_enabled(void) { return g_pp_enabled; }
+extern "C" int ds4_gpu_pp_ngpu(void) { return g_pp_ngpu; }
+extern "C" int ds4_gpu_pp_layer_start(int g) { return (g >= 0 && g < g_pp_ngpu) ? g_pp_layer_start[g] : -1; }
+extern "C" int ds4_gpu_pp_layer_end(int g) { return (g >= 0 && g < g_pp_ngpu) ? g_pp_layer_end[g] : -1; }
+extern "C" void *ds4_gpu_pp_active_ptr(int g) { return (g >= 0 && g < g_pp_ngpu) ? g_pp_active[g] : NULL; }
+extern "C" int ds4_gpu_pp_p2p_copy(int dst_gpu, int src_gpu) {
+    if (dst_gpu < 0 || dst_gpu >= g_pp_ngpu || src_gpu < 0 || src_gpu >= g_pp_ngpu) return 0;
+    cudaError_t ce = cudaMemcpyPeer(g_pp_active[dst_gpu], dst_gpu,
+                                     g_pp_active[src_gpu], src_gpu,
+                                     4 * 4096 * sizeof(float));
+    return ce == cudaSuccess ? 1 : 0;
+}
+
 extern "C" void ds4_gpu_cleanup(void) {
     (void)cudaDeviceSynchronize();
     if (g_cublas_ready) {

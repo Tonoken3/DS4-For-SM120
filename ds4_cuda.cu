@@ -216,7 +216,9 @@ extern "C" int ds4_gpu_decode_graph_can_capture(void) {
         !g_model_device_owned &&
         !g_model_registered &&
         !cuda_model_direct_host_access_allowed();
-    if (!temp_moe_weights) return 1;
+    /* Compact selected-expert path is capture-safe; scratch gets allocated
+     * on first use during the warmup token. */
+    if (!temp_moe_weights || cuda_moe_temp_weights_enabled()) return 1;
     if (!g_decode_graph_capture_disabled_notice_printed) {
         fprintf(stderr,
                 "ds4: CUDA graph capture disabled: MoE weights are streamed "
@@ -10484,6 +10486,18 @@ static int routed_moe_launch(
             }
         }
         if (g_moe_compact_gate && g_moe_compact_per_expert >= compact_exp_bytes) {
+            int capture_active = 0;
+            if (g_cuda_decode_stream_created) {
+                cudaStreamCaptureStatus st;
+                if (cudaSuccess == cudaStreamIsCapturing(ds4_decode_stream(), &st))
+                    capture_active = (st == cudaStreamCaptureStatusActive);
+            }
+            if (capture_active) {
+                use_compact = 1;
+                gate_w = g_moe_compact_gate;
+                up_w   = g_moe_compact_up;
+                down_w = g_moe_compact_down;
+            } else {
             /* Read selected indices from device (6 int32 = 24 bytes, fast) */
             int32_t host_selected[6];
             cudaError_t ce = cudaMemcpy(host_selected, selected->ptr,
@@ -10520,6 +10534,7 @@ static int routed_moe_launch(
             } else {
                 (void)cudaGetLastError();
             }
+            } /* !capture_active */
         }
     }
 

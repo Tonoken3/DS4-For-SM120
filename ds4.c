@@ -9139,8 +9139,10 @@ static bool metal_graph_alloc_pp(ds4_pp_gpu *pp, int ngpu, const ds4_model *mode
                 (uint64_t)DS4_N_HC * sizeof(float), ds4_gpu_tensor_bytes(ref->hc_post));
         }
 
-        /* GPU 0 gets output head tensors (logits, etc.). Others skip them. */
-        if (gp == 0) {
+        /* GPU 0 and last GPU get output head tensors.
+         * GPU 0: for prefill fallback / compatibility.
+         * Last GPU: for PP decode output_head execution. */
+        if (gp == 0 || gp == ngpu - 1) {
             PP_ALLOC_TENSOR(output_pre);
             PP_ALLOC_TENSOR(output_weights);
             PP_ALLOC_TENSOR(output_embd);
@@ -11966,21 +11968,11 @@ static bool metal_graph_encode_token_raw_swa_pp(
 
     if (ok && need_logits) {
         int last = ngpu - 1;
-        if (async_p2p) {
-            ok = ds4_gpu_pp_p2p_copy_ordered_async(0, last,
-                ds4_gpu_tensor_device_ptr(g0->cur_hc),
-                ds4_gpu_tensor_device_ptr(pp[last].g.cur_hc),
-                ds4_gpu_tensor_bytes(pp[last].g.cur_hc)) != 0;
-        } else {
-            ds4_gpu_pp_set_device(last);
-            ds4_gpu_synchronize();
-            ok = ds4_gpu_pp_p2p_copy_ptr(0, last,
-                ds4_gpu_tensor_device_ptr(g0->cur_hc),
-                ds4_gpu_tensor_device_ptr(pp[last].g.cur_hc),
-                ds4_gpu_tensor_bytes(pp[last].g.cur_hc)) != 0;
-        }
-        ds4_gpu_pp_set_device(0);
-        ok = metal_graph_encode_output_head(g0, model, weights, weights->output->dim[1]);
+        /* Run output_head on the last GPU instead of GPU0.
+         * The last GPU's cur_hc already holds the final activation after
+         * the last layer swap, so no P2P copy is needed. */
+        ds4_gpu_pp_set_device(last);
+        ok = metal_graph_encode_output_head(&pp[last].g, model, weights, weights->output->dim[1]);
     }
     ds4_gpu_pp_set_device(0);
     return ok;
@@ -14073,8 +14065,12 @@ static bool metal_graph_eval_token_raw_swa(
     const double t_done = (profile || throttle) ? now_sec() : 0.0;
 
     if (ok && logits) {
-        /* PP mode writes logits into g_pp_graphs[0].g.logits, not g->logits */
-        ds4_gpu_tensor *logits_src = (pp_mode && g_pp_graphs) ? g_pp_graphs[0].g.logits : g->logits;
+        /* PP mode writes logits into the last GPU's logits tensor */
+        ds4_gpu_tensor *logits_src = g->logits;
+        if (pp_mode && g_pp_graphs) {
+            int last = g_pp_graphs_ngpu - 1;
+            if (last >= 0) logits_src = g_pp_graphs[last].g.logits;
+        }
         ok = ds4_gpu_tensor_read(logits_src, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
     }
     const double t_read = (profile || throttle) ? now_sec() : 0.0;
@@ -16829,7 +16825,11 @@ static int generate_metal_graph_raw_swa(
                             pos2++;
                         }
                     }
-                    if (bl < 0 && g != 0) continue;
+                    /* Non-layer weights: GPU 0 always caches. Last GPU also caches
+                     * output head weights so it can run output_head locally. */
+                    int is_output_weight = (t->name.len >= 6 &&
+                        (memcmp(t->name.ptr, "output", 6) == 0));
+                    if (bl < 0 && g != 0 && !(g == ngpu - 1 && is_output_weight)) continue;
                     if (bl >= 0 && (bl < l0 || bl > l1)) continue;
                     char label[128];
                     snprintf(label, sizeof(label), "pp:%.*s", (int)(t->name.len > 120 ? 120 : t->name.len), t->name.ptr);

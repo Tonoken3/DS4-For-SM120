@@ -328,6 +328,13 @@ static cudaEvent_t g_model_stage_event[4];
 static uint64_t g_model_stage_bytes;
 static int g_moe_temp_weights_notice_printed;
 static int g_moe_compact_notice_printed;
+
+/* Pipeline Parallelism (PP) state */
+static int g_pp_ngpu;
+static int g_pp_enabled;
+static int g_pp_layer_start[7];
+static int g_pp_layer_end[7];
+static float *g_pp_active[7];
 static int g_moe_scratch_inited;
 
 /* Persistent MoE scratch: pre-allocated buffer for one layer's full expert
@@ -354,6 +361,7 @@ static int cuda_decode_graph_enabled(void);
 static int cuda_model_direct_host_access_allowed(void);
 static int cuda_moe_temp_weights_enabled(void);
 static int cuda_cublas_decode_enabled(void);
+static int ds4_gpu_pp_init(void);
 static const char *cuda_model_range_ptr_from_fd(
         const void *model_map,
         uint64_t offset,
@@ -1658,6 +1666,9 @@ extern "C" int ds4_gpu_init(void) {
 
         g_cublas_ready = 1;
     }
+
+    (void)ds4_gpu_pp_init();
+
     return 1;
 }
 
@@ -1684,6 +1695,50 @@ void ds4_gpu_init_moe_scratch(uint64_t gate_bytes, uint64_t up_bytes, uint64_t d
     g_moe_scratch_inited = 1;
     fprintf(stderr, "ds4: MoE persistent scratch allocated (gate=%.2f up=%.2f down=%.2f MiB)\n",
             (double)gate_bytes / 1048576.0, (double)up_bytes / 1048576.0, (double)down_bytes / 1048576.0);
+}
+
+static int ds4_gpu_pp_init(void) {
+    const char *pp_env = getenv("DS4_CUDA_PP");
+    if (!pp_env || !pp_env[0] || pp_env[0] == '0') return 1;
+    int ngpu = 0;
+    if (cudaGetDeviceCount(&ngpu) != cudaSuccess || ngpu < 2) return 0;
+    g_pp_ngpu = ngpu;
+
+    int ok = 1;
+    for (int i = 0; i < ngpu; i++) {
+        cudaSetDevice(i);
+        for (int j = 0; j < ngpu; j++) {
+            if (i == j) continue;
+            int can = 0;
+            cudaError_t ce = cudaDeviceCanAccessPeer(&can, i, j);
+            if (ce != cudaSuccess || !can) { ok = 0; continue; }
+            ce = cudaDeviceEnablePeerAccess(j, 0);
+            if (ce != cudaSuccess && ce != cudaErrorPeerAccessAlreadyEnabled)
+                ok = 0;
+        }
+    }
+    if (!ok) { g_pp_ngpu = 0; return 0; }
+
+    int total_layers = 43;
+    int per_gpu = total_layers / ngpu;
+    int rem = total_layers % ngpu;
+    int il = 0;
+    for (int g = 0; g < ngpu; g++) {
+        g_pp_layer_start[g] = il;
+        int n = per_gpu + (g < rem ? 1 : 0);
+        g_pp_layer_end[g] = il + n - 1;
+        il += n;
+        cudaSetDevice(g);
+        if (cudaMalloc(&g_pp_active[g], 4 * 4096 * sizeof(float)) != cudaSuccess) {
+            (void)cudaGetLastError(); ok = 0;
+        }
+    }
+    g_pp_enabled = ok;
+    cudaSetDevice(0);
+    if (g_pp_enabled)
+        fprintf(stderr, "ds4: PP=%d ready (%d layers/GPU, GPU0: L%d-%d)\n",
+                ngpu, per_gpu, g_pp_layer_start[0], g_pp_layer_end[0]);
+    return ok ? 1 : 0;
 }
 
 extern "C" void ds4_gpu_cleanup(void) {
@@ -1780,6 +1835,17 @@ extern "C" void ds4_gpu_cleanup(void) {
     if (g_moe_compact_down) { (void)cudaFree(g_moe_compact_down); g_moe_compact_down = NULL; }
     if (g_moe_compact_selected_dev) { (void)cudaFree(g_moe_compact_selected_dev); g_moe_compact_selected_dev = NULL; }
     g_moe_compact_per_expert = 0;
+    if (g_pp_enabled) {
+        for (int g = 0; g < g_pp_ngpu; g++) {
+            cudaSetDevice(g);
+            (void)cudaFree(g_pp_active[g]);
+            g_pp_active[g] = NULL;
+        }
+        memset(g_pp_layer_start, 0, sizeof(g_pp_layer_start));
+        memset(g_pp_layer_end, 0, sizeof(g_pp_layer_end));
+        g_pp_ngpu = 0;
+        g_pp_enabled = 0;
+    }
 }
 
 __global__ static void fill_f32_kernel(float *x, uint64_t n, float v);

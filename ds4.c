@@ -11939,8 +11939,8 @@ static bool metal_graph_encode_token_raw_swa_pp(
                the source device's kernels (on any stream) have finished first. */
             ds4_gpu_synchronize();
             ok = ds4_gpu_pp_p2p_copy_ptr(gp + 1, gp,
-                ds4_gpu_tensor_contents(pp[gp + 1].g.cur_hc),
-                ds4_gpu_tensor_contents(gg->cur_hc),
+                ds4_gpu_tensor_device_ptr(pp[gp + 1].g.cur_hc),
+                ds4_gpu_tensor_device_ptr(gg->cur_hc),
                 ds4_gpu_tensor_bytes(gg->cur_hc)) != 0;
         }
     }
@@ -11950,8 +11950,8 @@ static bool metal_graph_encode_token_raw_swa_pp(
         ds4_gpu_pp_set_device(last);
         ds4_gpu_synchronize();
         ok = ds4_gpu_pp_p2p_copy_ptr(0, last,
-            ds4_gpu_tensor_contents(g0->cur_hc),
-            ds4_gpu_tensor_contents(pp[last].g.cur_hc),
+            ds4_gpu_tensor_device_ptr(g0->cur_hc),
+            ds4_gpu_tensor_device_ptr(pp[last].g.cur_hc),
             ds4_gpu_tensor_bytes(pp[last].g.cur_hc)) != 0;
         ds4_gpu_pp_set_device(0);
         ok = metal_graph_encode_output_head(g0, model, weights, weights->output->dim[1]);

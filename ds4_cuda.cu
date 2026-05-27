@@ -459,6 +459,8 @@ static int g_pp_layer_end[7];
 static float *g_pp_active[7];
 static ncclComm_t g_pp_nccl_comms[7];
 static int g_pp_nccl_ready;
+static cudaStream_t g_pp_stream[DS4_CUDA_MAX_DEVICES];
+static cudaEvent_t g_pp_event[DS4_CUDA_MAX_DEVICES];
 static int g_moe_scratch_inited;
 
 /* Persistent MoE scratch: pre-allocated buffer for one layer's full expert
@@ -1943,6 +1945,21 @@ static int ds4_gpu_pp_init(void) {
             (void)cudaGetLastError(); ok = 0;
         }
     }
+        g_pp_topology_ready = ok;
+    if (ok) {
+        for (int g = 0; g < ngpu; g++) {
+            cudaSetDevice(g);
+            if (!g_pp_stream[g]) {
+                cudaError_t ce = cudaStreamCreate(&g_pp_stream[g]);
+                if (ce != cudaSuccess) { ok = 0; break; }
+            }
+            if (!g_pp_event[g]) {
+                cudaError_t ce = cudaEventCreate(&g_pp_event[g]);
+                if (ce != cudaSuccess) { ok = 0; break; }
+            }
+        }
+        cudaSetDevice(0);
+    }
     g_pp_topology_ready = ok;
     if (ok && getenv("DS4_CUDA_PP_NCCL") != NULL) {
         ncclResult_t nr = ncclCommInitAll(g_pp_nccl_comms, ngpu, NULL);
@@ -2183,6 +2200,8 @@ extern "C" void ds4_gpu_cleanup(void) {
         }
         for (int g = 0; g < g_pp_ngpu; g++) {
             cudaSetDevice(g);
+            if (g_pp_stream[g]) { (void)cudaStreamDestroy(g_pp_stream[g]); g_pp_stream[g] = NULL; }
+            if (g_pp_event[g]) { (void)cudaEventDestroy(g_pp_event[g]); g_pp_event[g] = NULL; }
             (void)cudaFree(g_pp_active[g]);
             g_pp_active[g] = NULL;
         }
@@ -2313,6 +2332,12 @@ extern "C" void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor) {
     if (!tensor) return NULL;
     (void)cudaDeviceSynchronize();
     return tensor->ptr;
+}
+
+/* No-sync variant for PP hot path where we only need the device pointer
+   (not reading tensor data on host). */
+extern "C" void *ds4_gpu_tensor_device_ptr(ds4_gpu_tensor *tensor) {
+    return tensor ? tensor->ptr : NULL;
 }
 
 extern "C" int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count) {

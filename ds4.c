@@ -13664,7 +13664,8 @@ static bool metal_graph_eval_token_raw_swa(
     const bool graph_capture_mode = graph_mode && g->cuda_params_host &&
                                     ds4_gpu_decode_graph_can_capture() != 0;
 
-    /* Phase 2: fill and push decode params for graph replay */
+    /* Phase 2: fill decode params for future graph replay. Replay is disabled
+     * for now, so keep kernels on their immediate arguments for correctness. */
     if (graph_mode && g->cuda_params_host) {
         ds4_cuda_decode_params *p = g->cuda_params_host;
         p->token = (int32_t)token;
@@ -13678,7 +13679,7 @@ static bool metal_graph_eval_token_raw_swa(
             p->layer_n_comp[il] = g->layer_n_comp[il];
             p->layer_n_index_comp[il] = g->layer_n_index_comp[il];
         }
-        ds4_gpu_decode_params_push(p);
+        ds4_gpu_decode_params_deactivate();
     }
 
     bool ok = ds4_gpu_begin_commands() != 0;

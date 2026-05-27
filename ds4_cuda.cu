@@ -135,8 +135,9 @@ extern "C" int ds4_gpu_decode_params_push(const ds4_cuda_decode_params *host) {
 /* Deactivate device params (restore immediate-argument behavior). */
 extern "C" int ds4_gpu_decode_params_deactivate(void) {
     const int inactive = 0;
+    cudaStream_t s = ds4_decode_stream();
     cudaError_t ce = cudaMemcpyToSymbolAsync(
-            ds4_cuda_params_active, &inactive, sizeof(inactive), 0, cudaMemcpyHostToDevice, 0);
+            ds4_cuda_params_active, &inactive, sizeof(inactive), 0, cudaMemcpyHostToDevice, s);
     if (ce != cudaSuccess) { (void)cudaGetLastError(); return 0; }
     return 1;
 }
@@ -4850,7 +4851,7 @@ __global__ static void router_select_kernel(
     for (int i = 0; i < 256; i++) prob[i] = sqrtf(softplus_dev(log[i]));
 
     if (hash_mode) {
-        int32_t tok = tokens ? tokens[t] : token_scalar;
+        int32_t tok = tokens ? tokens[t] : token;
         if (tok < 0 || (uint32_t)tok >= hash_rows) tok = 0;
         const int32_t *row = hash + (uint64_t)tok * 6;
         for (int i = 0; i < 6; i++) sel[i] = row[i];
@@ -10616,10 +10617,18 @@ static int routed_moe_launch(
                 up_w   = g_moe_compact_up;
                 down_w = g_moe_compact_down;
             } else {
-            /* Read selected indices from device (6 int32 = 24 bytes, fast) */
+            /* Read selected indices from device (6 int32 = 24 bytes, fast).
+             * With the graph decode stream enabled, router kernels run on a
+             * non-default stream, so synchronize it before this host read. */
             int32_t host_selected[6];
-            cudaError_t ce = cudaMemcpy(host_selected, selected->ptr,
-                                        (size_t)n_expert * 4, cudaMemcpyDeviceToHost);
+            cudaStream_t decode_stream = ds4_decode_stream();
+            cudaError_t ce = decode_stream
+                ? cudaStreamSynchronize(decode_stream)
+                : cudaSuccess;
+            if (ce == cudaSuccess) {
+                ce = cudaMemcpy(host_selected, selected->ptr,
+                                (size_t)n_expert * 4, cudaMemcpyDeviceToHost);
+            }
             if (ce == cudaSuccess) {
                 use_compact = 1;
                 /* Copy each selected expert's weights to compact scratch */

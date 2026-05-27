@@ -550,6 +550,8 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
 
 static int cuda_moe_temp_weights_enabled(void) {
     if (getenv("DS4_CUDA_NO_MOE_TEMP_WEIGHTS") != NULL) return 0;
+    /* PP resident mode: weights are arena-cached on each GPU, no H2D needed */
+    if (g_pp_enabled) return 0;
     const char *env = getenv("DS4_CUDA_MOE_TEMP_WEIGHTS");
     if (env && env[0]) return env[0] != '0';
     if (cuda_decode_graph_enabled()) return 1;
@@ -4839,6 +4841,7 @@ __global__ static void router_select_kernel(
         int hash_mode) {
     uint32_t t = blockIdx.x;
     if (t >= n_tokens || threadIdx.x != 0) return;
+    int32_t token = ds4_cuda_params_active ? ds4_cuda_dev_params.token : token_scalar;
     const float *log = logits + (uint64_t)t * 256;
     float *prob = probs + (uint64_t)t * 256;
     int32_t *sel = selected + (uint64_t)t * 6;
@@ -4977,7 +4980,8 @@ __global__ static void router_select_warp_topk_kernel(
 
     if (hash_mode) {
         if (lane == 0) {
-            int32_t tok = tokens ? tokens[t] : token_scalar;
+        int32_t tok = ds4_cuda_params_active ? ds4_cuda_dev_params.token :
+                        (tokens ? tokens[t] : token_scalar);
             if (tok < 0 || (uint32_t)tok >= hash_rows) tok = 0;
             const int32_t *row = hash + (uint64_t)tok * 6u;
             float sum = 0.0f;

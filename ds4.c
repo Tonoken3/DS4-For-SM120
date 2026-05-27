@@ -13713,36 +13713,56 @@ static bool metal_graph_eval_token_raw_swa(
         ds4_gpu_pp_set_device(0);
         if (profile) t_encoded = now_sec();
     } else {
+        const int subgraphs_ready =
+            graph_capture_mode && ds4_gpu_decode_subgraphs_ready();
 
+        if (ok && graph_capture_mode && !subgraphs_ready && pos > 10) {
+            /* Capture is kept as a build-up step, but captured work is not the
+             * correctness path until kernel node parameters are updated per
+             * token. Run normal encode below for the current token too. */
+            uint32_t saved_n_comp[DS4_N_LAYER];
+            uint32_t saved_n_index_comp[DS4_N_LAYER];
+            memcpy(saved_n_comp, g->layer_n_comp, sizeof(saved_n_comp));
+            memcpy(saved_n_index_comp, g->layer_n_index_comp, sizeof(saved_n_index_comp));
 
-    if (graph_capture_mode && ds4_gpu_decode_subgraphs_ready()) {
-        /* Per-layer sub-graph replay */
-        for (uint32_t il = 0; il < DS4_N_LAYER && ok; il++)
-            ok = ok && ds4_gpu_decode_subgraph_launch((int)il);
-        if (profile) t_encoded = now_sec();
-    } else if (graph_capture_mode && pos > 10) {
-        /* Per-layer sub-graph capture */
-        fprintf(stderr, "ds4: sub-graph capture pos=%u\n", pos);
-        for (uint32_t il = 0; il < DS4_N_LAYER && ok; il++) {
-            const ds4_layer_weights *layer = &weights->layer[il];
-            ok = ok && ds4_gpu_decode_graph_capture();
-            ok = ok && metal_graph_encode_decode_layer(g, model, layer, (uint32_t)il,
-                     pos, g->layer_raw_cache[il], g->raw_cap,
-                     pos % g->raw_cap,
-                     ((uint32_t)pos + 1 > g->raw_window ? g->raw_window : (uint32_t)pos + 1),
-                     token, false);
-            ok = ok && ds4_gpu_decode_graph_capture_end_store((int)il);
+            fprintf(stderr, "ds4: sub-graph capture pos=%u\n", pos);
+            for (uint32_t il = 0; il < DS4_N_LAYER && ok; il++) {
+                const ds4_layer_weights *layer = &weights->layer[il];
+                uint32_t n_raw = (uint32_t)pos + 1;
+                if (n_raw > g->raw_window) n_raw = g->raw_window;
+                if (n_raw > g->raw_cap) n_raw = g->raw_cap;
+
+                ok = ok && ds4_gpu_decode_graph_capture();
+                /* Replay stays disabled until cudaGraphKernelNodeSetParams is
+                 * wired for token/pos and per-layer dynamic arguments. */
+                ok = ok && metal_graph_encode_decode_layer(g, model, layer, il,
+                         pos, g->layer_raw_cache[il], g->raw_cap,
+                         pos % g->raw_cap, n_raw, token, false);
+                ok = ok && ds4_gpu_decode_graph_capture_end_store((int)il);
+            }
+            memcpy(g->layer_n_comp, saved_n_comp, sizeof(saved_n_comp));
+            memcpy(g->layer_n_index_comp, saved_n_index_comp, sizeof(saved_n_index_comp));
+            if (ok) {
+                fprintf(stderr,
+                        "ds4: %u sub-graphs captured; replay disabled, using normal encode\n",
+                        DS4_N_LAYER);
+            }
+        } else if (profile && subgraphs_ready) {
+            fprintf(stderr,
+                    "ds4: sub-graph replay disabled; using normal encode pos=%u\n",
+                    pos);
         }
-        if (ok) fprintf(stderr, "ds4: %u sub-graphs captured\n", DS4_N_LAYER);
-        if (profile) t_encoded = now_sec();
-    } else {
-        /* Normal encode */
-        fprintf(stderr, "ds4: graph normal path pos=%u graph_mode=%d host=%p\n", pos, graph_mode, (void*)g->cuda_params_host);
-        if (ok) ok = metal_graph_encode_token_raw_swa(g, model, weights,
-                                                      token, pos, logits != NULL, true);
-        if (profile) t_encoded = now_sec();
-    }
 
+        if (ok) {
+            if (profile) {
+                fprintf(stderr,
+                        "ds4: graph normal path pos=%u graph_mode=%d host=%p\n",
+                        pos, graph_mode, (void*)g->cuda_params_host);
+            }
+            ok = metal_graph_encode_token_raw_swa(g, model, weights,
+                                                  token, pos, logits != NULL, true);
+            if (profile) t_encoded = now_sec();
+        }
     } /* end pp_mode else */
 
     if (ok) ok = ds4_gpu_end_commands() != 0;

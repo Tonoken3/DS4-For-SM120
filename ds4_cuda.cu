@@ -105,6 +105,8 @@ static cudaStream_t ds4_decode_stream(void) {
 static cudaGraph_t g_cuda_decode_graph;
 static cudaGraphExec_t g_cuda_decode_graph_exec;
 static int g_cuda_decode_graph_captured;
+static cudaGraphExec_t g_sub_graph_exec[43];
+static int g_sub_graph_exec_ready[43];
 static int g_decode_graph_capture_disabled_notice_printed;
 
 static int cuda_model_direct_host_access_allowed(void);
@@ -190,6 +192,31 @@ extern "C" int ds4_gpu_decode_graph_capture_end(void) {
     fprintf(stderr, "ds4: CUDA decode graph captured and instantiated\n");
     return 1;
 }
+extern "C" int ds4_gpu_decode_graph_capture_end_store(int layer) {
+    if (layer < 0 || layer >= 43 || !g_cuda_decode_stream_created) return 0;
+    cudaGraph_t graph = NULL;
+    cudaError_t ce = cudaStreamEndCapture(g_cuda_decode_stream, &graph);
+    if (ce != cudaSuccess || !graph) {
+        if (ce != cudaSuccess) (void)cudaGetLastError();
+        return 0;
+    }
+    ce = cudaGraphInstantiate(&g_sub_graph_exec[layer], graph, NULL, NULL, 0);
+    (void)cudaGraphDestroy(graph);
+    if (ce != cudaSuccess) { (void)cudaGetLastError(); return 0; }
+    g_sub_graph_exec_ready[layer] = 1;
+    return 1;
+}
+
+extern "C" int ds4_gpu_decode_subgraph_launch(int layer) {
+    if (layer < 0 || layer >= 43 || !g_sub_graph_exec[layer]) return 0;
+    return cudaGraphLaunch(g_sub_graph_exec[layer], ds4_decode_stream()) == cudaSuccess ? 1 : 0;
+}
+
+extern "C" int ds4_gpu_decode_subgraphs_ready(void) {
+    for (int i = 0; i < 43; i++) if (!g_sub_graph_exec_ready[i]) return 0;
+    return 1;
+}
+
 
 /* Launch the captured decode graph. */
 extern "C" int ds4_gpu_decode_graph_launch(void) {
@@ -1840,6 +1867,10 @@ extern "C" void ds4_gpu_cleanup(void) {
         g_cuda_decode_graph = NULL;
     }
     g_cuda_decode_graph_captured = 0;
+    for (int i = 0; i < 43; i++) {
+        if (g_sub_graph_exec[i]) { (void)cudaGraphExecDestroy(g_sub_graph_exec[i]); g_sub_graph_exec[i] = NULL; }
+        g_sub_graph_exec_ready[i] = 0;
+    }
     if (g_moe_scratch_gate) { (void)cudaFree(g_moe_scratch_gate); g_moe_scratch_gate = NULL; }
     if (g_moe_scratch_up)   { (void)cudaFree(g_moe_scratch_up);   g_moe_scratch_up = NULL; }
     if (g_moe_scratch_down) { (void)cudaFree(g_moe_scratch_down); g_moe_scratch_down = NULL; }

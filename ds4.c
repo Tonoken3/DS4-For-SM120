@@ -9980,7 +9980,8 @@ static bool metal_graph_encode_decode_layer(
         uint32_t                raw_cap,
         uint32_t                raw_row,
         uint32_t                n_raw,
-        int                     token) {
+        int                     token,
+        bool                    skip_router) {
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
     const uint64_t q_rank = layer->attn_q_a->dim[1];
@@ -10620,6 +10621,7 @@ static bool metal_graph_encode_decode_layer(
     const uint64_t gate_expert_bytes = expert_mid_dim * gate_row_bytes;
     const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
     const uint64_t down_expert_bytes = routed_out_dim * down_row_bytes;
+    if (!skip_router) {
     if (ok) ok = metal_graph_matmul_plain_tensor(g->router_logits, model, layer->ffn_gate_inp,
                                                  DS4_N_EMBD, DS4_N_EXPERT, g->ffn_norm, 1);
     if (ok) ok = ds4_gpu_router_select_tensor(g->router_selected, g->router_weights, g->router_probs,
@@ -10643,6 +10645,7 @@ static bool metal_graph_encode_decode_layer(
         metal_graph_debug_dump_i32_tensor("ffn_moe_topk", g->router_selected, DS4_N_EXPERT_USED, il, pos);
         metal_graph_debug_dump_tensor("ffn_moe_weights_scaled", g->router_weights, DS4_N_EXPERT_USED, il, pos);
     }
+    } /* !skip_router */
     if (ok) ok = ds4_gpu_routed_moe_one_tensor(g->routed_out,
                                                  g->routed_gate,
                                                  g->routed_up,
@@ -11368,7 +11371,7 @@ static int metal_graph_decode_test(
                                                g.raw_cap,
                                                0,
                                                1,
-                                               token);
+                                               token, false);
     if (ok) {
         ds4_gpu_tensor *embedded_hc = g.cur_hc;
         g.cur_hc = g.after_ffn_hc;
@@ -11526,7 +11529,7 @@ static int metal_graph_first_token_full_test(
             }
             ok = ds4_gpu_begin_commands() != 0;
             if (ok) ok = metal_graph_encode_decode_layer(&g, model, &weights->layer[il],
-                                                       il, 0, g.layer_raw_cache[il], g.raw_cap, 0, 1, token);
+                                                       il, 0, g.layer_raw_cache[il], g.raw_cap, 0, 1, token, false);
             ds4_gpu_tensor *tmp = g.cur_hc;
             g.cur_hc = g.after_ffn_hc;
             g.after_ffn_hc = tmp;
@@ -11571,7 +11574,7 @@ static int metal_graph_first_token_full_test(
         for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
             ok = metal_graph_encode_decode_layer(&g, model, &weights->layer[il],
                                                  il, 0, g.layer_raw_cache[il],
-                                                 g.raw_cap, 0, 1, token);
+                                                 g.raw_cap, 0, 1, token, false);
             ds4_gpu_tensor *tmp = g.cur_hc;
             g.cur_hc = g.after_ffn_hc;
             g.after_ffn_hc = tmp;
@@ -11674,7 +11677,7 @@ static bool metal_graph_encode_token_raw_swa(
                                              g->raw_cap,
                                              raw_row,
                                              n_raw,
-                                             token);
+                                             token, false);
         ds4_gpu_tensor *tmp = g->cur_hc;
         g->cur_hc = g->after_ffn_hc;
         g->after_ffn_hc = tmp;
@@ -13704,7 +13707,7 @@ static bool metal_graph_eval_token_raw_swa(
                 if (n_raw > g->raw_cap) n_raw = g->raw_cap;
                 ok = metal_graph_encode_decode_layer(g, model, layer, (uint32_t)il,
                          pos, g->layer_raw_cache[il], g->raw_cap,
-                         raw_row, n_raw, token);
+                         raw_row, n_raw, token, false);
             }
         }
         ds4_gpu_pp_set_device(0);
@@ -13888,7 +13891,7 @@ static bool metal_graph_eval_mtp_draft_from_hc(
                                              g->raw_cap,
                                              raw_row,
                                              n_raw,
-                                             token);
+                                             token, false);
     }
     if (ok) g->cur_hc = out_hc;
     if (ok) ok = metal_graph_encode_output_head_mtp(g,
@@ -14787,7 +14790,7 @@ static bool metal_graph_verify_decode2_exact(
                                              g->raw_cap,
                                              pos0 % g->raw_cap,
                                              metal_graph_raw_span_for_batch(g, pos0, 1),
-                                             token0);
+                                             token0, false);
         if (!ok) break;
         ok = metal_graph_capture_prefix1_attn_state(g, il) &&
              metal_graph_capture_prefix1_index_state(g, il);
@@ -14804,7 +14807,7 @@ static bool metal_graph_verify_decode2_exact(
                                              g->raw_cap,
                                              pos1 % g->raw_cap,
                                              metal_graph_raw_span_for_batch(g, pos1, 1),
-                                             token1);
+                                             token1, false);
         if (!ok) break;
 
         ds4_gpu_tensor *tmp = cur0; cur0 = next0; next0 = tmp;

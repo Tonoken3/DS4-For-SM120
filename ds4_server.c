@@ -11371,7 +11371,7 @@ static void usage(FILE *fp) {
         "      Touch mapped tensor pages before serving. Slower startup, fewer first-use stalls.\n"
         "  --power N\n"
         "      Target GPU duty cycle percentage, 1..100. Default: 100\n"
-        "  --metal | --cuda | --cpu | --backend NAME\n"
+        "  --metal | --cuda | --hybrid | --cpu | --backend NAME\n"
         "      Select backend explicitly. Defaults to Metal on macOS and CUDA on CUDA builds.\n"
         "\n"
         "HTTP API:\n"
@@ -11435,9 +11435,10 @@ static void usage(FILE *fp) {
 static ds4_backend parse_backend_arg(const char *s, const char *arg) {
     if (!strcmp(s, "metal")) return DS4_BACKEND_METAL;
     if (!strcmp(s, "cuda")) return DS4_BACKEND_CUDA;
+    if (!strcmp(s, "hybrid")) return DS4_BACKEND_HYBRID;
     if (!strcmp(s, "cpu")) return DS4_BACKEND_CPU;
     server_log(DS4_LOG_DEFAULT, "ds4-server: invalid %s value: %s", arg, s);
-    server_log(DS4_LOG_DEFAULT, "ds4-server: valid server backends are: metal, cuda, cpu");
+    server_log(DS4_LOG_DEFAULT, "ds4-server: valid server backends are: metal, cuda, hybrid, cpu");
     exit(2);
 }
 
@@ -11539,6 +11540,8 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.backend = DS4_BACKEND_METAL;
         } else if (!strcmp(arg, "--cuda")) {
             c.engine.backend = DS4_BACKEND_CUDA;
+        } else if (!strcmp(arg, "--hybrid")) {
+            c.engine.backend = DS4_BACKEND_HYBRID;
         } else if (!strcmp(arg, "--backend")) {
             c.engine.backend = parse_backend_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--cpu")) {

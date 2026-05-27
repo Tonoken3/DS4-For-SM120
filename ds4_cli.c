@@ -237,9 +237,10 @@ static float parse_float_range(const char *s, const char *opt, float min, float 
 static ds4_backend parse_backend(const char *s) {
     if (!strcmp(s, "metal")) return DS4_BACKEND_METAL;
     if (!strcmp(s, "cuda")) return DS4_BACKEND_CUDA;
+    if (!strcmp(s, "hybrid")) return DS4_BACKEND_HYBRID;
     if (!strcmp(s, "cpu")) return DS4_BACKEND_CPU;
     fprintf(stderr, "ds4: invalid backend: %s\n", s);
-    fprintf(stderr, "ds4: valid backends are: metal, cuda, cpu\n");
+    fprintf(stderr, "ds4: valid backends are: metal, cuda, hybrid, cpu\n");
     exit(2);
 }
 

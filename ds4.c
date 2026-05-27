@@ -35,6 +35,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#if defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#endif
+
 #include "ds4.h"
 
 #ifndef DS4_NO_GPU
@@ -306,6 +310,25 @@ static int g_ds4_lock_fd = -1;
 #define DS4_MAYBE_UNUSED
 #endif
 
+#if defined(__AVX2__)
+static inline int32_t ds4_hsum_epi32_avx2(__m256i v) {
+    __m128i lo = _mm256_castsi256_si128(v);
+    __m128i hi = _mm256_extracti128_si256(v, 1);
+    __m128i sum = _mm_add_epi32(lo, hi);
+    sum = _mm_hadd_epi32(sum, sum);
+    sum = _mm_hadd_epi32(sum, sum);
+    return _mm_cvtsi128_si32(sum);
+}
+
+static inline int32_t ds4_dot_i8_16_avx2(const int8_t *a, const int8_t *b) {
+    const __m128i av = _mm_loadu_si128((const __m128i *)(const void *)a);
+    const __m128i bv = _mm_loadu_si128((const __m128i *)(const void *)b);
+    const __m256i a16 = _mm256_cvtepi8_epi16(av);
+    const __m256i b16 = _mm256_cvtepi8_epi16(bv);
+    return ds4_hsum_epi32_avx2(_mm256_madd_epi16(a16, b16));
+}
+#endif
+
 /* =========================================================================
  * GGUF Quant Block Formats.
  * =========================================================================
@@ -515,7 +538,15 @@ static void iq2xxs_signed_grid_init(void) {
 }
 
 static inline DS4_MAYBE_UNUSED int32_t dot_iq2_pair_16(const int8_t *grid0, const int8_t *grid1, const int8_t *q8) {
-#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+#if defined(__AVX2__)
+    const __m128i lo = _mm_loadl_epi64((const __m128i *)(const void *)grid0);
+    const __m128i hi = _mm_loadl_epi64((const __m128i *)(const void *)grid1);
+    const __m128i gv = _mm_unpacklo_epi64(lo, hi);
+    const __m128i qv = _mm_loadu_si128((const __m128i *)(const void *)q8);
+    const __m256i g16 = _mm256_cvtepi8_epi16(gv);
+    const __m256i q16 = _mm256_cvtepi8_epi16(qv);
+    return ds4_hsum_epi32_avx2(_mm256_madd_epi16(g16, q16));
+#elif defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
     const int8x16_t gv = vcombine_s8(vld1_s8(grid0), vld1_s8(grid1));
     const int32x4_t acc = vdotq_s32(vdupq_n_s32(0), gv, vld1q_s8(q8));
     return vaddvq_s32(acc);
@@ -534,7 +565,36 @@ static inline DS4_MAYBE_UNUSED int32_t dot_iq2_pair_16(const int8_t *grid0, cons
 }
 
 static inline DS4_MAYBE_UNUSED int32_t dot_q2_16(const uint8_t *q2, const int8_t *q8, int shift) {
-#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+#if defined(__AVXVNNI__) && defined(__AVX2__)
+    const __m128i packed = _mm_loadu_si128((const __m128i *)(const void *)q2);
+    __m128i shifted;
+    switch (shift) {
+    case 0: shifted = packed; break;
+    case 2: shifted = _mm_srli_epi16(packed, 2); break;
+    case 4: shifted = _mm_srli_epi16(packed, 4); break;
+    default: shifted = _mm_srli_epi16(packed, 6); break;
+    }
+    const __m128i vals = _mm_and_si128(shifted, _mm_set1_epi8(3));
+    const __m128i q8v = _mm_loadu_si128((const __m128i *)(const void *)q8);
+    const __m256i vals256 = _mm256_set_m128i(_mm_setzero_si128(), vals);
+    const __m256i q8v256 = _mm256_set_m128i(_mm_setzero_si128(), q8v);
+    const __m256i acc = _mm256_dpbusd_epi32(_mm256_setzero_si256(), vals256, q8v256);
+    return ds4_hsum_epi32_avx2(acc);
+#elif defined(__AVX2__)
+    const __m128i packed = _mm_loadu_si128((const __m128i *)(const void *)q2);
+    __m128i shifted;
+    switch (shift) {
+    case 0: shifted = packed; break;
+    case 2: shifted = _mm_srli_epi16(packed, 2); break;
+    case 4: shifted = _mm_srli_epi16(packed, 4); break;
+    default: shifted = _mm_srli_epi16(packed, 6); break;
+    }
+    const __m128i vals = _mm_and_si128(shifted, _mm_set1_epi8(3));
+    const __m256i vals16 = _mm256_cvtepu8_epi16(vals);
+    const __m128i q8v = _mm_loadu_si128((const __m128i *)(const void *)q8);
+    const __m256i q816 = _mm256_cvtepi8_epi16(q8v);
+    return ds4_hsum_epi32_avx2(_mm256_madd_epi16(q816, vals16));
+#elif defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
     const uint8x16_t packed = vld1q_u8(q2);
     uint8x16_t shifted;
     switch (shift) {
@@ -829,7 +889,7 @@ static void cpu_directional_steering_project_rows(
 
 typedef void (*ds4_parallel_fn)(void *ctx, uint64_t row0, uint64_t row1);
 
-#define DS4_MAX_THREADS 32
+#define DS4_MAX_THREADS 64
 
 typedef struct {
     pthread_t threads[DS4_MAX_THREADS];
@@ -1638,6 +1698,15 @@ static uint64_t accelerator_cuda_preload_span_bytes(void) {
     return mb * 1048576ull;
 }
 
+static bool ds4_str_contains(ds4_str s, const char *z) {
+    size_t n = strlen(z);
+    if (s.len < n) return false;
+    for (uint64_t i = 0; i + n <= s.len; i++) {
+        if (memcmp(s.ptr + i, z, n) == 0) return true;
+    }
+    return false;
+}
+
 static bool accelerator_cache_model_tensor_spans(const ds4_model *m, uint64_t *cached_out) {
     accelerator_tensor_span *spans = xmalloc((size_t)m->n_tensors * sizeof(spans[0]));
     uint64_t nspan = 0;
@@ -1647,6 +1716,13 @@ static bool accelerator_cache_model_tensor_spans(const ds4_model *m, uint64_t *c
         if (t->abs_offset > m->size || t->bytes > m->size - t->abs_offset) {
             free(spans);
             return false;
+        }
+        /* Skip MoE expert tensors — they are too large to pre-cache on 16 GiB GPUs
+         * and will be streamed on-demand during graph execution (6 experts/layer). */
+        if (ds4_str_contains(t->name, "gate_exps") ||
+            ds4_str_contains(t->name, "up_exps") ||
+            ds4_str_contains(t->name, "down_exps")) {
+            continue;
         }
         spans[nspan++] = (accelerator_tensor_span){
             .off = t->abs_offset,
@@ -1693,6 +1769,17 @@ static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model
     if (backend != DS4_BACKEND_CUDA) return true;
     if (!m || !m->map || m->size == 0) return false;
     if (getenv("DS4_CUDA_DIRECT_MODEL") != NULL) {
+        return true;
+    }
+
+    /* Skip full-model cache on small GPUs (<=16 GiB) to avoid OOM.
+     * Heuristic: if the model tensor data is >12 GiB, assume VRAM is tight.
+     * Expert-resident multi-GPU (--backend hybrid) does not use this path. */
+    if (getenv("DS4_CUDA_FORCE_WEIGHT_CACHE") == NULL &&
+        m->tensor_data_pos > 0 &&
+        m->size - m->tensor_data_pos > 12ull * 1073741824ull) {
+        fprintf(stderr, "ds4: model tensor data >12 GiB; skipping full-model weight cache "
+                "(set DS4_CUDA_FORCE_WEIGHT_CACHE=1 to override, or use --backend hybrid)\n");
         return true;
     }
 
@@ -2317,6 +2404,66 @@ static void ds4_vec_dot_iq2_xxs_pair_q8_K(
 
     *s0 = 0.25f * total0;
     *s1 = 0.25f * total1;
+#elif defined(__AVX2__)
+    const int nb = n / QK_K;
+    float total0 = 0.0f;
+    float total1 = 0.0f;
+
+    for (int i = 0; i < nb; i++) {
+        const float d0 = f16_to_f32(x0[i].d) * y[i].d;
+        const float d1 = f16_to_f32(x1[i].d) * y[i].d;
+        const uint16_t *q20 = x0[i].qs;
+        const uint16_t *q21 = x1[i].qs;
+        const int8_t *q8 = y[i].qs;
+        int32_t bsum0 = 0;
+        int32_t bsum1 = 0;
+
+        for (int ib32 = 0; ib32 < QK_K / 32; ib32++) {
+            uint32_t aux0[2];
+            uint32_t aux1[2];
+            memcpy(aux0, q20, sizeof(aux0));
+            memcpy(aux1, q21, sizeof(aux1));
+            q20 += 4;
+            q21 += 4;
+            const uint8_t *a0 = (const uint8_t *)aux0;
+            const uint8_t *a1 = (const uint8_t *)aux1;
+
+            const uint32_t ls0 = 2u * (aux0[1] >> 28) + 1u;
+            const uint32_t ls1 = 2u * (aux1[1] >> 28) + 1u;
+            const uint32_t s00 = (aux0[1] >>  0) & 127u;
+            const uint32_t s01 = (aux0[1] >>  7) & 127u;
+            const uint32_t s02 = (aux0[1] >> 14) & 127u;
+            const uint32_t s03 = (aux0[1] >> 21) & 127u;
+            const uint32_t s10 = (aux1[1] >>  0) & 127u;
+            const uint32_t s11 = (aux1[1] >>  7) & 127u;
+            const uint32_t s12 = (aux1[1] >> 14) & 127u;
+            const uint32_t s13 = (aux1[1] >> 21) & 127u;
+
+            const int32_t sumi0 =
+                dot_iq2_pair_16(iq2xxs_signed_grid[a0[0]][s00],
+                                iq2xxs_signed_grid[a0[1]][s01],
+                                q8) +
+                dot_iq2_pair_16(iq2xxs_signed_grid[a0[2]][s02],
+                                iq2xxs_signed_grid[a0[3]][s03],
+                                q8 + 16);
+            const int32_t sumi1 =
+                dot_iq2_pair_16(iq2xxs_signed_grid[a1[0]][s10],
+                                iq2xxs_signed_grid[a1[1]][s11],
+                                q8) +
+                dot_iq2_pair_16(iq2xxs_signed_grid[a1[2]][s12],
+                                iq2xxs_signed_grid[a1[3]][s13],
+                                q8 + 16);
+            bsum0 += sumi0 * (int32_t)ls0;
+            bsum1 += sumi1 * (int32_t)ls1;
+            q8 += 32;
+        }
+
+        total0 += d0 * (float)bsum0;
+        total1 += d1 * (float)bsum1;
+    }
+
+    *s0 = 0.125f * total0;
+    *s1 = 0.125f * total1;
 #else
     ds4_vec_dot_iq2_xxs_q8_K(n, s0, x0, y);
     ds4_vec_dot_iq2_xxs_q8_K(n, s1, x1, y);
@@ -3300,7 +3447,11 @@ typedef struct {
 } quantize_q8_0_batch_ctx;
 
 static inline int32_t dot_i8_32(const int8_t *a, const int8_t *b, uint64_t n) {
-#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+#if defined(__AVX2__)
+    if (n == 32) {
+        return ds4_dot_i8_16_avx2(a, b) + ds4_dot_i8_16_avx2(a + 16, b + 16);
+    }
+#elif defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
     if (n == 32) {
         int32x4_t acc = vdupq_n_s32(0);
         acc = vdotq_s32(acc, vld1q_s8(a),      vld1q_s8(b));
@@ -5835,7 +5986,6 @@ static void layer_routed_moe_one_prealloc(
     if (expert_in_dim % QK_K != 0) ds4_die("IQ2_XXS expert input is not QK_K aligned");
     if (down_in_dim != DS4_N_FF_EXP || down_in_dim % QK_K != 0) ds4_die("Q2_K expert input has an unexpected layout");
 
-    memset(out, 0, (size_t)DS4_N_EMBD * sizeof(out[0]));
     ds4_quantize_row_q8_K(x, xq, (int64_t)expert_in_dim);
 
     if (layer->ffn_gate_tid2eid) {
@@ -5845,6 +5995,7 @@ static void layer_routed_moe_one_prealloc(
         layer_topk_selected_experts(selected, expert_weight, model, layer, x);
     }
 
+    memset(out, 0, (size_t)DS4_N_EMBD * sizeof(out[0]));
     matvec_iq2_xxs_experts_mid_prequant(mid_all, model,
                                         layer->ffn_gate_exps,
                                         layer->ffn_up_exps,
@@ -8684,6 +8835,10 @@ typedef struct {
     double decode_token_avg_sec;
     bool quality;
     bool mtp_enabled;
+    /* Phase 2: CUDA Graph decode dynamic params */
+    ds4_cuda_decode_params *cuda_params_host;
+    void                    *cuda_params_dev;
+    uint64_t                 cuda_params_bytes;
 } ds4_gpu_graph;
 
 static bool graph_power_throttle_enabled(const ds4_gpu_graph *g) {
@@ -8855,6 +9010,11 @@ static void metal_graph_free(ds4_gpu_graph *g) {
     ds4_gpu_tensor_free(g->hc_mix);
     ds4_gpu_tensor_free(g->flat_hc);
     ds4_gpu_tensor_free(g->cur_hc);
+    /* Phase 2: CUDA Graph decode params cleanup */
+    ds4_gpu_decode_params_free(g->cuda_params_host, g->cuda_params_dev, g->cuda_params_bytes);
+    g->cuda_params_host = NULL;
+    g->cuda_params_dev = NULL;
+    g->cuda_params_bytes = 0;
     memset(g, 0, sizeof(*g));
 }
 
@@ -9153,6 +9313,18 @@ static bool metal_graph_alloc_raw_cap(
         bool                    enable_mtp) {
     memset(g, 0, sizeof(*g));
     g->mtp_enabled = enable_mtp;
+
+    /* Phase 2: allocate CUDA Graph decode params when graph mode is active */
+    const char *dg_env = getenv("DS4_CUDA_DECODE_GRAPH");
+    if (dg_env && dg_env[0] && dg_env[0] != '0') {
+        if (!ds4_gpu_decode_params_alloc(&g->cuda_params_host,
+                                          &g->cuda_params_dev,
+                                          &g->cuda_params_bytes)) {
+            memset(g, 0, sizeof(*g));
+            return false;
+        }
+    }
+
     if (raw_cap == 0) raw_cap = 1;
     if (ctx_size == 0) ctx_size = raw_cap;
     if (prefill_cap == 0) prefill_cap = 1;
@@ -13480,13 +13652,55 @@ static bool metal_graph_eval_token_raw_swa(
         int                    token,
         uint32_t               pos,
         float                 *logits) {
-    const bool profile = getenv("DS4_METAL_GRAPH_TOKEN_PROFILE") != NULL;
+    const bool profile = getenv("DS4_METAL_GRAPH_TOKEN_PROFILE") != NULL ||
+                         getenv("DS4_CUDA_DECODE_GRAPH_PROFILE") != NULL;
     const bool throttle = graph_power_throttle_enabled(g);
     const double t0 = (profile || throttle) ? now_sec() : 0.0;
+    const bool graph_mode = getenv("DS4_CUDA_DECODE_GRAPH") != NULL;
+
+    /* Phase 2: fill and push decode params for graph replay */
+    if (graph_mode && g->cuda_params_host) {
+        ds4_cuda_decode_params *p = g->cuda_params_host;
+        p->token = (int32_t)token;
+        p->pos = pos;
+        p->raw_row = pos % g->raw_cap;
+        p->n_raw = (uint32_t)pos + 1;
+        if (p->n_raw > g->raw_window) p->n_raw = g->raw_window;
+        if (p->n_raw > g->raw_cap) p->n_raw = g->raw_cap;
+        p->need_logits = (logits != NULL) ? 1 : 0;
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            p->layer_n_comp[il] = g->layer_n_comp[il];
+            p->layer_n_index_comp[il] = g->layer_n_index_comp[il];
+        }
+        ds4_gpu_decode_params_push(p);
+    }
 
     bool ok = ds4_gpu_begin_commands() != 0;
-    if (ok) ok = metal_graph_encode_token_raw_swa(g, model, weights, token, pos, logits != NULL, true);
-    const double t_encoded = (profile || throttle) ? now_sec() : 0.0;
+    double t_encoded = (profile || throttle) ? now_sec() : 0.0;
+
+    if (graph_mode && ds4_gpu_decode_graph_captured()) {
+        /* Replay the captured graph — params already staged on host,
+         * push to device, then submit graph launch. */
+        ok = ok && ds4_gpu_decode_params_push(g->cuda_params_host);
+        ok = ok && ds4_gpu_decode_graph_launch();
+        if (profile) t_encoded = now_sec();
+    } else if (graph_mode && g->cuda_params_host && pos > 10) {
+        /* First decode (pos > prefill end): warm all weight caches, then capture.
+         * The token_embd and other weights are cached during the normal decode
+         * below, and the SECOND decode uses graph capture/replay. */
+        ok = ok && ds4_gpu_decode_graph_capture();
+        if (ok) ok = ds4_gpu_decode_params_push(g->cuda_params_host);
+        if (ok) ok = metal_graph_encode_token_raw_swa(g, model, weights,
+                                                      token, pos, logits != NULL, true);
+        if (profile) t_encoded = now_sec();
+        if (ok) ok = ds4_gpu_decode_graph_capture_end();
+    } else {
+        /* Normal encode (no graph mode, or first token where weights are cold) */
+        if (ok) ok = metal_graph_encode_token_raw_swa(g, model, weights,
+                                                      token, pos, logits != NULL, true);
+        if (profile) t_encoded = now_sec();
+    }
+
     if (ok) ok = ds4_gpu_end_commands() != 0;
     const double t_done = (profile || throttle) ? now_sec() : 0.0;
 
@@ -13494,9 +13708,10 @@ static bool metal_graph_eval_token_raw_swa(
         ok = ds4_gpu_tensor_read(g->logits, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
     }
     const double t_read = (profile || throttle) ? now_sec() : 0.0;
+
     if (profile) {
         fprintf(stderr,
-                "ds4: metal graph token pos=%u encode=%.3f ms execute=%.3f ms read=%.3f ms total=%.3f ms logits=%d\n",
+                "ds4: graph token pos=%u encode=%.3f ms execute=%.3f ms read=%.3f ms total=%.3f ms logits=%d\n",
                 pos,
                 (t_encoded - t0) * 1000.0,
                 (t_done - t_encoded) * 1000.0,
@@ -16317,8 +16532,9 @@ ds4_context_memory ds4_context_memory_estimate(ds4_backend backend, int ctx_size
 const char *ds4_backend_name(ds4_backend backend) {
     switch (backend) {
     case DS4_BACKEND_METAL: return "metal";
-    case DS4_BACKEND_CUDA:  return "cuda";
-    case DS4_BACKEND_CPU:   return "cpu";
+    case DS4_BACKEND_CUDA:   return "cuda";
+    case DS4_BACKEND_HYBRID: return "hybrid";
+    case DS4_BACKEND_CPU:    return "cpu";
     }
     return "unknown";
 }
@@ -16701,7 +16917,9 @@ static DS4_MAYBE_UNUSED int payload_read_tensor_span_f32_as_f16(FILE *fp, ds4_gp
 #endif
 
 static bool ds4_session_is_cpu(const ds4_session *s) {
-    return s && s->engine && s->engine->backend == DS4_BACKEND_CPU;
+    return s && s->engine &&
+        (s->engine->backend == DS4_BACKEND_CPU ||
+         s->engine->backend == DS4_BACKEND_HYBRID);
 }
 
 static uint32_t session_cpu_raw_live_rows(const ds4_session *s) {
@@ -18102,7 +18320,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     }
 #else
     if (graph_backend) {
-        fprintf(stderr, "ds4: %s backend requested but this build has no graph backend support; aborting startup\n",
+        fprintf(stderr, "ds4: %s backend requested but this build has no GPU support; aborting startup\n",
                 ds4_backend_name(e->backend));
         ds4_engine_close(e);
         *out = NULL;
@@ -18160,7 +18378,7 @@ void ds4_engine_close(ds4_engine *e) {
 
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     if (!out || !e || ctx_size <= 0) return 1;
-    if (e->backend == DS4_BACKEND_CPU) {
+    if (e->backend == DS4_BACKEND_CPU || e->backend == DS4_BACKEND_HYBRID) {
         ds4_session *s = xcalloc(1, sizeof(*s));
         s->engine = e;
         s->ctx_size = ctx_size;

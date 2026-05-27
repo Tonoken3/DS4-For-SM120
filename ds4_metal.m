@@ -12048,6 +12048,41 @@ int ds4_gpu_attention_prefill_masked_mixed_heads_tensor(
     return 1;
 }
 
+void ds4_hybrid_scratch_free(ds4_hybrid_scratch *s) {
+    (void)s;
+}
+
+int ds4_gpu_attention_decode_hybrid(
+        ds4_hybrid_scratch      *scratch,
+        float                   *out_heads_cpu,
+        const void              *model_map,
+        uint64_t                 model_size,
+        uint64_t                 sinks_offset,
+        const float             *q_cpu,
+        uint32_t                 n_head,
+        uint32_t                 head_dim,
+        const float             *raw_kv_cpu,
+        uint32_t                 n_raw,
+        const float             *comp_kv_cpu,
+        uint32_t                 n_comp,
+        const bool              *comp_allowed_cpu) {
+    (void)scratch;
+    (void)out_heads_cpu;
+    (void)model_map;
+    (void)model_size;
+    (void)sinks_offset;
+    (void)q_cpu;
+    (void)n_head;
+    (void)head_dim;
+    (void)raw_kv_cpu;
+    (void)n_raw;
+    (void)comp_kv_cpu;
+    (void)n_comp;
+    (void)comp_allowed_cpu;
+    fprintf(stderr, "ds4: hybrid backend requires CUDA\n");
+    return 0;
+}
+
 int ds4_gpu_attention_decode_heads_tensor(
         ds4_gpu_tensor       *heads,
         const void             *model_map,

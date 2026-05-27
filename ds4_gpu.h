@@ -824,4 +824,42 @@ int ds4_gpu_matmul_q8_0_hc_expand_tensor(
         uint32_t                n_embd,
         uint32_t                n_hc);
 
+/* =========================================================================
+ * CUDA Graph decode: dynamic parameters (Phase 2+).
+ * ========================================================================= */
+
+#define DS4_GPU_MAX_LAYER 61
+
+typedef struct {
+    int32_t  token;
+    uint32_t pos;
+    uint32_t raw_row;
+    uint32_t n_raw;
+    uint32_t need_logits;
+    uint32_t layer_n_comp[DS4_GPU_MAX_LAYER];
+    uint32_t layer_n_index_comp[DS4_GPU_MAX_LAYER];
+} ds4_cuda_decode_params;
+
+/* Allocate/free pinned host + device copies of decode params.
+ * Returns 1 on success, 0 on failure. */
+int ds4_gpu_decode_params_alloc(ds4_cuda_decode_params **host,
+                                void                    **device,
+                                uint64_t                 *bytes);
+void ds4_gpu_decode_params_free(ds4_cuda_decode_params *host,
+                                void                    *device,
+                                uint64_t                 bytes);
+
+/* Push host params to the device global symbol (kernel-visible).
+ * Returns 1 on success. Must be called before graph launch. */
+int ds4_gpu_decode_params_push(const ds4_cuda_decode_params *host);
+
+/* Deactivate device params; subsequent kernel launches use immediate args. */
+int ds4_gpu_decode_params_deactivate(void);
+
+/* Phase 3: CUDA Graph capture/replay */
+int ds4_gpu_decode_graph_capture(void);          /* begin capture */
+int ds4_gpu_decode_graph_capture_end(void);       /* end capture + instantiate */
+int ds4_gpu_decode_graph_launch(void);            /* replay captured graph */
+int ds4_gpu_decode_graph_captured(void);          /* 1 if ready for replay */
+
 #endif

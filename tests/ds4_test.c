@@ -37,10 +37,12 @@ static ds4_engine *test_open_engine(bool quality) {
     ds4_engine *engine = NULL;
     ds4_engine_options opt = {
         .model_path = test_model_path(),
+/* Tests default to CPU backend to avoid CUDA OOM on 16 GiB GPUs.
+ * For CUDA-specific tests, use ds4-bench or explicit --backend cuda. */
 #ifdef __APPLE__
         .backend = DS4_BACKEND_METAL,
 #else
-        .backend = DS4_BACKEND_CUDA,
+        .backend = DS4_BACKEND_CPU,
 #endif
         .quality = quality,
     };

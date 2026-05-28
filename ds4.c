@@ -16900,6 +16900,19 @@ static void ds4_tp_matmul_selftest(const ds4_model *model, const ds4_weights *we
      * timing, for TP degree 2 (and 4 if enough GPUs). */
     (void)ds4_gpu_tp_matmul_jig(model->map, model->size, w->abs_offset, in_dim, out_dim, 2);
     (void)ds4_gpu_tp_matmul_jig(model->map, model->size, w->abs_offset, in_dim, out_dim, 4);
+
+    /* TP FFN-block jig: full SwiGLU MLP (shared expert) col->swiglu->row->all-reduce. */
+    const ds4_tensor *gsx = weights->layer[0].ffn_gate_shexp;
+    const ds4_tensor *usx = weights->layer[0].ffn_up_shexp;
+    const ds4_tensor *dsx = weights->layer[0].ffn_down_shexp;
+    if (gsx && usx && dsx && gsx->type == DS4_TENSOR_Q8_0 && usx->type == DS4_TENSOR_Q8_0 &&
+        dsx->type == DS4_TENSOR_Q8_0 && gsx->ndim == 2) {
+        const uint64_t ffn_in = gsx->dim[0], ffn_ff = gsx->dim[1];
+        (void)ds4_gpu_tp_ffn_jig(model->map, model->size, gsx->abs_offset, usx->abs_offset,
+                                 dsx->abs_offset, ffn_in, ffn_ff, DS4_SWIGLU_CLAMP_EXP, 2);
+        (void)ds4_gpu_tp_ffn_jig(model->map, model->size, gsx->abs_offset, usx->abs_offset,
+                                 dsx->abs_offset, ffn_in, ffn_ff, DS4_SWIGLU_CLAMP_EXP, 4);
+    }
 }
 
 /* Metal generation entry point.  The model runs as one local whole-graph

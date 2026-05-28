@@ -7749,6 +7749,111 @@ extern "C" int ds4_gpu_tp_matmul_jig(
     return (ok && rel_col<1e-3 && rel_row<1e-3) ? 1 : 0;
 }
 
+/* TP jig: a full SwiGLU MLP block (the shared-expert FFN) split across k GPUs vs
+ * the single-GPU golden. This is the Megatron MLP pattern end-to-end:
+ *   gate,up = column-parallel matmul (each rank owns ff_dim/k output cols)
+ *   mid     = swiglu(gate,up) elementwise on each rank's slice (no comm)
+ *   down    = row-parallel matmul (each rank's mid slice = its input blocks)
+ *   out     = ONE all-reduce of the n_embd partials.
+ * Validates that the col-parallel output feeds row-parallel with zero intermediate
+ * comm. All three weights are Q8_0. Reports rel error vs golden + timing. */
+extern "C" int ds4_gpu_tp_ffn_jig(
+        const void *model_map, uint64_t model_size,
+        uint64_t gate_off, uint64_t up_off, uint64_t down_off,
+        uint64_t in_dim, uint64_t ff_dim, float clamp, int k) {
+    int ndev = 0; (void)cudaGetDeviceCount(&ndev);
+    if (k < 2 || k > ndev || k > 8) { fprintf(stderr, "ds4: TP FFN jig: need 2..%d GPUs (k=%d)\n", ndev, k); return 0; }
+    const uint64_t inb = (in_dim + 31) / 32;       /* gate/up input blocks (n_embd) */
+    const uint64_t ffb = (ff_dim + 31) / 32;       /* down input blocks (ff_dim)    */
+    const uint64_t gate_wb = ff_dim * inb * 34, down_wb = in_dim * ffb * 34;
+    if ((ff_dim % (uint64_t)k) != 0 || (ffb % (uint64_t)k) != 0) {
+        fprintf(stderr, "ds4: TP FFN jig: ff_dim(%llu)/blocks(%llu) not divisible by k=%d; skip\n",
+                (unsigned long long)ff_dim, (unsigned long long)ffb, k); return 0;
+    }
+    const int dp4a = cuda_q8_use_dp4a();
+    const int iters = 30;
+    int saved = 0; (void)cudaGetDevice(&saved);
+    int ok = 1;
+
+    if (cudaSetDevice(0) != cudaSuccess) return 0;
+    const char *gW = cuda_model_range_ptr(model_map, gate_off, gate_wb, "tp_ffn_gate");
+    const char *uW = cuda_model_range_ptr(model_map, up_off,   gate_wb, "tp_ffn_up");
+    const char *dW = cuda_model_range_ptr(model_map, down_off, down_wb, "tp_ffn_down");
+    if (!gW || !uW || !dW) { fprintf(stderr, "ds4: TP FFN jig: weights not resident on dev0\n"); return 0; }
+
+    /* golden full FFN on dev0 */
+    float *x=NULL,*g=NULL,*u=NULL,*mid=NULL,*outF=NULL; int8_t *xq=NULL,*midq=NULL; float *xs=NULL,*mids=NULL;
+    std::vector<float> hx(in_dim); for (uint64_t i=0;i<in_dim;i++) hx[i]=sinf((float)i*0.009f)*0.4f;
+    ok = ok && cudaMalloc(&x,in_dim*4)==cudaSuccess && cudaMalloc(&xq,inb*32)==cudaSuccess && cudaMalloc(&xs,inb*4)==cudaSuccess
+            && cudaMalloc(&g,ff_dim*4)==cudaSuccess && cudaMalloc(&u,ff_dim*4)==cudaSuccess && cudaMalloc(&mid,ff_dim*4)==cudaSuccess
+            && cudaMalloc(&midq,ffb*32)==cudaSuccess && cudaMalloc(&mids,ffb*4)==cudaSuccess && cudaMalloc(&outF,in_dim*4)==cudaSuccess;
+    if (ok) ok = cudaMemcpy(x,hx.data(),in_dim*4,cudaMemcpyHostToDevice)==cudaSuccess;
+    if (ok) { quantize_q8_0_f32_kernel<<<(unsigned)inb,32>>>(xq,xs,x,in_dim,inb);
+              matmul_q8_0_preq_warp8_kernel<<<((unsigned)ff_dim+7u)/8u,256>>>(g,(const unsigned char*)gW,xq,xs,in_dim,ff_dim,inb,dp4a);
+              matmul_q8_0_preq_warp8_kernel<<<((unsigned)ff_dim+7u)/8u,256>>>(u,(const unsigned char*)uW,xq,xs,in_dim,ff_dim,inb,dp4a);
+              swiglu_kernel<<<((unsigned)ff_dim+255u)/256u,256>>>(mid,g,u,(uint32_t)ff_dim,clamp,1.0f);
+              quantize_q8_0_f32_kernel<<<(unsigned)ffb,32>>>(midq,mids,mid,ff_dim,ffb);
+              matmul_q8_0_preq_warp8_kernel<<<((unsigned)in_dim+7u)/8u,256>>>(outF,(const unsigned char*)dW,midq,mids,ff_dim,in_dim,ffb,dp4a);
+              ok = cudaDeviceSynchronize()==cudaSuccess && cudaGetLastError()==cudaSuccess; }
+    std::vector<float> hF(in_dim);
+    if (ok) ok = cudaMemcpy(hF.data(),outF,in_dim*4,cudaMemcpyDeviceToHost)==cudaSuccess;
+
+    /* TP across k GPUs */
+    const uint64_t ffpr = ff_dim/(uint64_t)k, bpr = ffb/(uint64_t)k;
+    char *gsh[8]={0},*ush[8]={0},*dsh[8]={0}; int8_t *xqr[8]={0},*mqr[8]={0}; float *xsr[8]={0},*msr[8]={0};
+    float *gr[8]={0},*ur[8]={0},*mr[8]={0},*pr[8]={0}; cudaStream_t st[8]={0};
+    char *packtmp=NULL; int devs[8]; for(int r=0;r<k;r++)devs[r]=r;
+    double ms_tp=0.0, rel=1.0;
+    if (ok) {
+        cudaSetDevice(0); ok = cudaMalloc(&packtmp,in_dim*bpr*34)==cudaSuccess;
+        for (int r=0;r<k && ok;r++) {
+            /* down row-shard: pack input blocks [r*bpr,(r+1)*bpr) of every out row on dev0, peer-copy */
+            ok = cudaMemcpy2D(packtmp,bpr*34,dW + (uint64_t)r*bpr*34,ffb*34,bpr*34,in_dim,cudaMemcpyDeviceToDevice)==cudaSuccess;
+            ok = ok && cudaSetDevice(r)==cudaSuccess && cudaStreamCreate(&st[r])==cudaSuccess;
+            ok = ok && cudaMalloc(&gsh[r],ffpr*inb*34)==cudaSuccess && cudaMalloc(&ush[r],ffpr*inb*34)==cudaSuccess
+                    && cudaMalloc(&dsh[r],in_dim*bpr*34)==cudaSuccess
+                    && cudaMalloc(&xqr[r],inb*32)==cudaSuccess && cudaMalloc(&xsr[r],inb*4)==cudaSuccess
+                    && cudaMalloc(&gr[r],ffpr*4)==cudaSuccess && cudaMalloc(&ur[r],ffpr*4)==cudaSuccess && cudaMalloc(&mr[r],ffpr*4)==cudaSuccess
+                    && cudaMalloc(&mqr[r],bpr*32)==cudaSuccess && cudaMalloc(&msr[r],bpr*4)==cudaSuccess && cudaMalloc(&pr[r],in_dim*4)==cudaSuccess;
+            /* col-shards of gate/up (contiguous output rows), replicated input, down row-shard */
+            ok = ok && cudaMemcpyPeer(gsh[r],r,gW + (uint64_t)r*ffpr*inb*34,0,ffpr*inb*34)==cudaSuccess;
+            ok = ok && cudaMemcpyPeer(ush[r],r,uW + (uint64_t)r*ffpr*inb*34,0,ffpr*inb*34)==cudaSuccess;
+            ok = ok && cudaMemcpyPeer(dsh[r],r,packtmp,0,in_dim*bpr*34)==cudaSuccess;
+            ok = ok && cudaMemcpyPeer(xqr[r],r,xq,0,inb*32)==cudaSuccess && cudaMemcpyPeer(xsr[r],r,xs,0,inb*4)==cudaSuccess;
+            cudaSetDevice(0);
+        }
+        for(int r=0;r<k;r++){cudaSetDevice(r);cudaDeviceSynchronize();}
+        double t0=tp_jig_now_ms();
+        for (int it=0; it<iters && ok; it++) {
+            for (int r=0;r<k;r++){ cudaSetDevice(r);
+                matmul_q8_0_preq_warp8_kernel<<<((unsigned)ffpr+7u)/8u,256,0,st[r]>>>(gr[r],(const unsigned char*)gsh[r],xqr[r],xsr[r],in_dim,ffpr,inb,dp4a);
+                matmul_q8_0_preq_warp8_kernel<<<((unsigned)ffpr+7u)/8u,256,0,st[r]>>>(ur[r],(const unsigned char*)ush[r],xqr[r],xsr[r],in_dim,ffpr,inb,dp4a);
+                swiglu_kernel<<<((unsigned)ffpr+255u)/256u,256,0,st[r]>>>(mr[r],gr[r],ur[r],(uint32_t)ffpr,clamp,1.0f);
+                quantize_q8_0_f32_kernel<<<(unsigned)bpr,32,0,st[r]>>>(mqr[r],msr[r],mr[r],ffpr,bpr);
+                matmul_q8_0_preq_warp8_kernel<<<((unsigned)in_dim+7u)/8u,256,0,st[r]>>>(pr[r],(const unsigned char*)dsh[r],mqr[r],msr[r],ffpr,in_dim,bpr,dp4a);
+            }
+            for(int r=0;r<k;r++){cudaSetDevice(r);cudaStreamSynchronize(st[r]);}
+            ok = ds4_gpu_tp_all_reduce_f32(devs,k,pr,(uint32_t)in_dim);
+        }
+        ms_tp=(tp_jig_now_ms()-t0)/iters;
+        cudaSetDevice(0); std::vector<float> hT(in_dim);
+        if (ok) ok = cudaMemcpy(hT.data(),pr[0],in_dim*4,cudaMemcpyDeviceToHost)==cudaSuccess;
+        double maxabs=0,scale=0; for(uint64_t i=0;i<in_dim;i++){double a=fabs((double)hF[i]);if(a>scale)scale=a;double d=fabs((double)hF[i]-(double)hT[i]);if(d>maxabs)maxabs=d;}
+        if(scale<1e-12)scale=1e-12; rel=maxabs/scale;
+        cudaSetDevice(0); if(packtmp)cudaFree(packtmp);
+        for(int r=0;r<k;r++){cudaSetDevice(r);
+            if(gsh[r])cudaFree(gsh[r]);if(ush[r])cudaFree(ush[r]);if(dsh[r])cudaFree(dsh[r]);
+            if(xqr[r])cudaFree(xqr[r]);if(xsr[r])cudaFree(xsr[r]);if(gr[r])cudaFree(gr[r]);if(ur[r])cudaFree(ur[r]);
+            if(mr[r])cudaFree(mr[r]);if(mqr[r])cudaFree(mqr[r]);if(msr[r])cudaFree(msr[r]);if(pr[r])cudaFree(pr[r]);
+            if(st[r])cudaStreamDestroy(st[r]);}
+    }
+    fprintf(stderr, "ds4: TP FFN-block jig k=%d in=%llu ff=%llu | %s rel=%.2e tp=%.4f ms (1 all-reduce/block)\n",
+            k, (unsigned long long)in_dim, (unsigned long long)ff_dim, rel<1e-3?"PASS":"FAIL", rel, ms_tp);
+    cudaSetDevice(0); cudaFree(x);cudaFree(xq);cudaFree(xs);cudaFree(g);cudaFree(u);cudaFree(mid);cudaFree(midq);cudaFree(mids);cudaFree(outF);
+    (void)cudaSetDevice(saved);
+    return (ok && rel<1e-3) ? 1 : 0;
+}
+
 extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
         ds4_gpu_tensor *out0,
         ds4_gpu_tensor *out1,

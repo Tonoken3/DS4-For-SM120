@@ -935,6 +935,13 @@ int ds4_gpu_tp_matmul_jig(
         const void *model_map, uint64_t model_size,
         uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, int k);
 
+/* TP jig for a full SwiGLU MLP block (shared-expert FFN) across k GPUs vs golden.
+ * col-parallel gate/up -> swiglu -> row-parallel down -> one all-reduce. */
+int ds4_gpu_tp_ffn_jig(
+        const void *model_map, uint64_t model_size,
+        uint64_t gate_off, uint64_t up_off, uint64_t down_off,
+        uint64_t in_dim, uint64_t ff_dim, float clamp, int k);
+
 int ds4_gpu_pp_event_record(int gpu);
 int ds4_gpu_pp_stream_wait_event(int gpu, int event_gpu);
 void *ds4_gpu_pp_stream_get(int gpu);

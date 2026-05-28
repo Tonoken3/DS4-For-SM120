@@ -535,6 +535,29 @@ struct cuda_q8_f32_range {
     float *device_ptr;
 };
 
+/* Tensor-Parallel weight shards: resident per-device slices the TP-aware decode
+ * path uses. Kept in a registry SEPARATE from g_model_ranges so the existing
+ * offset-keyed full-tensor lookups (prefill, non-TP decode) are never perturbed.
+ * Each (stage,rank) device holds exactly its own shard of a sharded weight; the
+ * TP encode resolves it by (parent offset, current device) via cuda_tp_shard_ptr. */
+enum cuda_tp_shard_kind {
+    DS4_TP_SHARD_COL = 0,   /* contiguous output-row slice (column-parallel) */
+    DS4_TP_SHARD_ROW = 1,   /* packed input-block slice    (row-parallel)    */
+};
+struct cuda_tp_shard {
+    const void *host_base;  /* model_map of the parent tensor                  */
+    uint64_t offset;        /* abs_offset of the parent (FULL) tensor          */
+    int rank;               /* TP rank within its group                        */
+    int k;                  /* TP degree                                       */
+    int kind;               /* cuda_tp_shard_kind                              */
+    int device;             /* CUDA device this shard lives on                 */
+    char *device_ptr;       /* the shard's bytes on `device`                   */
+    uint64_t bytes;         /* shard size                                      */
+    uint64_t out_dim;       /* COL: rows on this rank; ROW: full out_dim       */
+    uint64_t in_dim;        /* COL: full in_dim; ROW: this rank's in (bpr*32)  */
+    uint64_t blocks;        /* COL: full blocks; ROW: this rank's blocks (bpr) */
+};
+
 static std::vector<cuda_model_range> g_model_ranges;
 static std::vector<cuda_model_arena> g_model_arenas;
 static std::unordered_map<uint64_t, size_t> g_model_range_by_offset;
@@ -542,6 +565,8 @@ static std::vector<cuda_q8_f16_range> g_q8_f16_ranges;
 static std::unordered_map<uint64_t, size_t> g_q8_f16_by_offset;
 static std::vector<cuda_q8_f32_range> g_q8_f32_ranges;
 static std::unordered_map<uint64_t, size_t> g_q8_f32_by_offset;
+static std::vector<cuda_tp_shard> g_tp_shards;
+static uint64_t g_tp_shard_bytes;
 static uint64_t g_model_range_bytes;
 static uint64_t g_q8_f16_bytes;
 static uint64_t g_q8_f32_bytes;
@@ -2460,6 +2485,130 @@ extern "C" int ds4_gpu_cache_model_range_force(
     g_model_range_by_offset[offset] = g_model_ranges.size() - 1;
     g_model_range_bytes += bytes;
     return 1;
+}
+
+/* ---- Tensor-Parallel resident weight shards ----
+ * Resolve a TP shard for the CURRENT device by parent (model_map, offset).
+ * Returns the shard's device pointer and fills *kind plus the shard's matmul
+ * dims (out_dim/in_dim/blocks as stored). NULL if no shard for this device.
+ * Mirrors cuda_model_range_ptr's "must match current device" rule. */
+static const char *cuda_tp_shard_ptr(const void *model_map, uint64_t offset,
+                                     int *kind, uint64_t *out_dim,
+                                     uint64_t *in_dim, uint64_t *blocks) {
+    int cur = -1; (void)cudaGetDevice(&cur);
+    for (const cuda_tp_shard &s : g_tp_shards) {
+        if (s.host_base == model_map && s.offset == offset && s.device == cur) {
+            if (kind) *kind = s.kind;
+            if (out_dim) *out_dim = s.out_dim;
+            if (in_dim) *in_dim = s.in_dim;
+            if (blocks) *blocks = s.blocks;
+            return s.device_ptr;
+        }
+    }
+    return NULL;
+}
+
+/* Cache a COLUMN-parallel shard (Q8_0 [in_dim->out_dim]) on the current device:
+ * rank r owns the contiguous output-row slice [r*rpr,(r+1)*rpr), rpr=out_dim/k.
+ * That slice is a contiguous byte sub-range of the host tensor, so a plain H2D
+ * copy suffices (matches ds4_gpu_cache_model_range_force, just offset+length). */
+extern "C" int ds4_gpu_cache_col_shard(
+        const void *model_map, uint64_t model_size,
+        uint64_t offset, uint64_t in_dim, uint64_t out_dim,
+        int rank, int k, const char *label) {
+    if (!model_map || in_dim == 0 || out_dim == 0 || k < 1 || rank < 0 || rank >= k) return 0;
+    if ((out_dim % (uint64_t)k) != 0) {
+        fprintf(stderr, "ds4: col-shard %s: out_dim(%llu) not divisible by k=%d\n",
+                label ? label : "?", (unsigned long long)out_dim, k);
+        return 0;
+    }
+    const uint64_t blocks = (in_dim + 31) / 32;
+    const uint64_t rpr = out_dim / (uint64_t)k;
+    const uint64_t row_bytes = blocks * 34;
+    const uint64_t shard_bytes = rpr * row_bytes;
+    const uint64_t src_off = offset + (uint64_t)rank * shard_bytes;
+    if (src_off > model_size || shard_bytes > model_size - src_off) return 0;
+    void *dev = NULL;
+    cudaError_t err = cudaMalloc(&dev, (size_t)shard_bytes);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        fprintf(stderr, "ds4: col-shard %s alloc failed (%.2f MiB): %s\n",
+                label ? label : "?", (double)shard_bytes / 1048576.0, cudaGetErrorString(err));
+        return 0;
+    }
+    err = cudaMemcpy(dev, (const char *)model_map + src_off, (size_t)shard_bytes, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "ds4: col-shard %s copy failed: %s\n", label ? label : "?", cudaGetErrorString(err));
+        (void)cudaFree(dev); (void)cudaGetLastError();
+        return 0;
+    }
+    int cur = -1; (void)cudaGetDevice(&cur);
+    cuda_tp_shard s;
+    s.host_base = model_map; s.offset = offset; s.rank = rank; s.k = k;
+    s.kind = DS4_TP_SHARD_COL; s.device = cur; s.device_ptr = (char *)dev; s.bytes = shard_bytes;
+    s.out_dim = rpr; s.in_dim = in_dim; s.blocks = blocks;
+    g_tp_shards.push_back(s);
+    g_tp_shard_bytes += shard_bytes;
+    return 1;
+}
+
+/* Cache a ROW-parallel shard (Q8_0 [in_dim->out_dim]) on the current device:
+ * rank r owns the input-block slice [r*bpr,(r+1)*bpr), bpr=blocks/k, for EVERY
+ * output row. That is a strided gather, so pack it with cudaMemcpy2D (H2D) into
+ * a dense [out_dim x bpr] Q8_0 buffer — the same pack the TP jig validated, but
+ * straight from the host map (no resident full copy needed). The packed buffer
+ * is then a normal Q8_0 weight of in=bpr*32, out=out_dim, blocks=bpr. */
+extern "C" int ds4_gpu_cache_row_shard(
+        const void *model_map, uint64_t model_size,
+        uint64_t offset, uint64_t in_dim, uint64_t out_dim,
+        int rank, int k, const char *label) {
+    if (!model_map || in_dim == 0 || out_dim == 0 || k < 1 || rank < 0 || rank >= k) return 0;
+    const uint64_t blocks = (in_dim + 31) / 32;
+    if ((blocks % (uint64_t)k) != 0) {
+        fprintf(stderr, "ds4: row-shard %s: blocks(%llu) not divisible by k=%d\n",
+                label ? label : "?", (unsigned long long)blocks, k);
+        return 0;
+    }
+    const uint64_t bpr = blocks / (uint64_t)k;
+    const uint64_t full_bytes = out_dim * blocks * 34;
+    if (offset > model_size || full_bytes > model_size - offset) return 0;
+    const uint64_t dst_pitch = bpr * 34;
+    const uint64_t src_pitch = blocks * 34;
+    const uint64_t shard_bytes = out_dim * dst_pitch;
+    void *dev = NULL;
+    cudaError_t err = cudaMalloc(&dev, (size_t)shard_bytes);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        fprintf(stderr, "ds4: row-shard %s alloc failed (%.2f MiB): %s\n",
+                label ? label : "?", (double)shard_bytes / 1048576.0, cudaGetErrorString(err));
+        return 0;
+    }
+    const char *src = (const char *)model_map + offset + (uint64_t)rank * dst_pitch;
+    err = cudaMemcpy2D(dev, (size_t)dst_pitch, src, (size_t)src_pitch,
+                       (size_t)dst_pitch, (size_t)out_dim, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "ds4: row-shard %s pack failed: %s\n", label ? label : "?", cudaGetErrorString(err));
+        (void)cudaFree(dev); (void)cudaGetLastError();
+        return 0;
+    }
+    int cur = -1; (void)cudaGetDevice(&cur);
+    cuda_tp_shard s;
+    s.host_base = model_map; s.offset = offset; s.rank = rank; s.k = k;
+    s.kind = DS4_TP_SHARD_ROW; s.device = cur; s.device_ptr = (char *)dev; s.bytes = shard_bytes;
+    s.out_dim = out_dim; s.in_dim = bpr * 32; s.blocks = bpr;
+    g_tp_shards.push_back(s);
+    g_tp_shard_bytes += shard_bytes;
+    return 1;
+}
+
+extern "C" void ds4_gpu_tp_shards_release_all(void) {
+    int saved = -1; (void)cudaGetDevice(&saved);
+    for (const cuda_tp_shard &s : g_tp_shards) {
+        if (s.device_ptr) { (void)cudaSetDevice(s.device); (void)cudaFree(s.device_ptr); }
+    }
+    if (saved >= 0) (void)cudaSetDevice(saved);
+    g_tp_shards.clear();
+    g_tp_shard_bytes = 0;
 }
 
 extern "C" void ds4_gpu_cleanup(void) {
@@ -7852,6 +8001,113 @@ extern "C" int ds4_gpu_tp_ffn_jig(
     cudaSetDevice(0); cudaFree(x);cudaFree(xq);cudaFree(xs);cudaFree(g);cudaFree(u);cudaFree(mid);cudaFree(midq);cudaFree(mids);cudaFree(outF);
     (void)cudaSetDevice(saved);
     return (ok && rel<1e-3) ? 1 : 0;
+}
+
+/* TP RESIDENT-SHARD jig: validates the build-time shard-cache path the decode
+ * will actually use. Unlike ds4_gpu_tp_matmul_jig (which reshards with transient
+ * peer-copies inside the jig), this calls ds4_gpu_cache_col_shard /
+ * ds4_gpu_cache_row_shard to populate the resident g_tp_shards registry, then
+ * runs the matmul reading the shard back through cuda_tp_shard_ptr — proving the
+ * registry plumbing (build -> accessor -> matmul) reproduces the single-GPU golden. */
+extern "C" int ds4_gpu_tp_shard_jig(
+        const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, int k) {
+    int ndev = 0; (void)cudaGetDeviceCount(&ndev);
+    if (k < 2 || k > ndev || k > 8) { fprintf(stderr, "ds4: TP shard jig: need 2..%d GPUs (k=%d)\n", ndev, k); return 0; }
+    const uint64_t blocks = (in_dim + 31) / 32;
+    const uint64_t wbytes = out_dim * blocks * 34;
+    if (weight_offset > model_size || wbytes > model_size - weight_offset) return 0;
+    if ((out_dim % (uint64_t)k) != 0 || (blocks % (uint64_t)k) != 0) {
+        fprintf(stderr, "ds4: TP shard jig: out_dim(%llu)/blocks(%llu) not divisible by k=%d; skip\n",
+                (unsigned long long)out_dim, (unsigned long long)blocks, k); return 0;
+    }
+    const int dp4a = cuda_q8_use_dp4a();
+    int saved = 0; (void)cudaGetDevice(&saved);
+    int ok = 1;
+
+    /* dev0: input ramp, prequant, single-GPU golden full matmul */
+    if (cudaSetDevice(0) != cudaSuccess) return 0;
+    const char *wfull = cuda_model_range_ptr(model_map, weight_offset, wbytes, "tp_shard_jig");
+    if (!wfull) { fprintf(stderr, "ds4: TP shard jig: weight not resident on dev0\n"); return 0; }
+    float *x=NULL,*outF=NULL; int8_t *xqA=NULL; float *xsA=NULL;
+    std::vector<float> hx(in_dim); for (uint64_t i=0;i<in_dim;i++) hx[i]=sinf((float)i*0.011f)*0.5f;
+    ok = ok && cudaMalloc(&x,in_dim*4)==cudaSuccess && cudaMalloc(&xqA,blocks*32)==cudaSuccess
+            && cudaMalloc(&xsA,blocks*4)==cudaSuccess && cudaMalloc(&outF,out_dim*4)==cudaSuccess;
+    if (ok) ok = cudaMemcpy(x,hx.data(),in_dim*4,cudaMemcpyHostToDevice)==cudaSuccess;
+    if (ok) { quantize_q8_0_f32_kernel<<<(unsigned)blocks,32>>>(xqA,xsA,x,in_dim,blocks);
+              matmul_q8_0_preq_warp8_kernel<<<((unsigned)out_dim+7u)/8u,256>>>(outF,(const unsigned char*)wfull,xqA,xsA,in_dim,out_dim,blocks,dp4a);
+              ok = cudaDeviceSynchronize()==cudaSuccess && cudaGetLastError()==cudaSuccess; }
+    std::vector<float> hF(out_dim);
+    if (ok) ok = cudaMemcpy(hF.data(),outF,out_dim*4,cudaMemcpyDeviceToHost)==cudaSuccess;
+
+    int8_t *xqr[8]={0}; float *xsr[8]={0}; float *outr[8]={0}; cudaStream_t st[8]={0};
+    int devs[8]; for(int r=0;r<k;r++)devs[r]=r;
+    const uint64_t rpr = out_dim/(uint64_t)k;
+    const uint64_t bpr = blocks/(uint64_t)k;
+
+    /* ===== COLUMN-PARALLEL via the resident col-shard cache ===== */
+    double rel_col = 1.0;
+    if (ok) {
+        for (int r=0;r<k && ok;r++) {
+            ok = cudaSetDevice(r)==cudaSuccess && cudaStreamCreate(&st[r])==cudaSuccess;
+            ok = ok && ds4_gpu_cache_col_shard(model_map, model_size, weight_offset, in_dim, out_dim, r, k, "shardjig_col")!=0;
+            ok = ok && cudaMalloc(&xqr[r],blocks*32)==cudaSuccess && cudaMalloc(&xsr[r],blocks*4)==cudaSuccess
+                    && cudaMalloc(&outr[r],rpr*4)==cudaSuccess;
+            ok = ok && cudaMemcpyPeer(xqr[r],r,xqA,0,blocks*32)==cudaSuccess;
+            ok = ok && cudaMemcpyPeer(xsr[r],r,xsA,0,blocks*4)==cudaSuccess;
+        }
+        for (int r=0;r<k && ok;r++) {
+            ok = cudaSetDevice(r)==cudaSuccess;
+            int kind=-1; uint64_t so=0, si=0, sb=0;
+            const char *sh = cuda_tp_shard_ptr(model_map, weight_offset, &kind, &so, &si, &sb);
+            ok = ok && sh!=NULL && kind==DS4_TP_SHARD_COL && so==rpr && si==in_dim && sb==blocks;
+            if (ok) matmul_q8_0_preq_warp8_kernel<<<((unsigned)rpr+7u)/8u,256,0,st[r]>>>(outr[r],(const unsigned char*)sh,xqr[r],xsr[r],si,so,sb,dp4a);
+        }
+        float *outChk=NULL; std::vector<float> hC(out_dim);
+        if (ok) { cudaSetDevice(0); ok = cudaMalloc(&outChk,out_dim*4)==cudaSuccess; }
+        for (int r=0;r<k && ok;r++){ cudaSetDevice(r); ok = cudaStreamSynchronize(st[r])==cudaSuccess; }
+        for (int r=0;r<k && ok;r++){ cudaSetDevice(0); ok = cudaMemcpyPeer(outChk+(uint64_t)r*rpr,0,outr[r],r,rpr*4)==cudaSuccess; }
+        if (ok) { cudaSetDevice(0); cudaDeviceSynchronize(); ok = cudaMemcpy(hC.data(),outChk,out_dim*4,cudaMemcpyDeviceToHost)==cudaSuccess; }
+        if (ok) { double maxabs=0,scale=0; for(uint64_t i=0;i<out_dim;i++){double a=fabs((double)hF[i]);if(a>scale)scale=a;double d=fabs((double)hF[i]-(double)hC[i]);if(d>maxabs)maxabs=d;} if(scale<1e-12)scale=1e-12; rel_col=maxabs/scale; }
+        cudaSetDevice(0); if(outChk)cudaFree(outChk);
+        for (int r=0;r<k;r++){ cudaSetDevice(r); if(xqr[r])cudaFree(xqr[r]); if(xsr[r])cudaFree(xsr[r]); if(outr[r])cudaFree(outr[r]); if(st[r])cudaStreamDestroy(st[r]); xqr[r]=0;xsr[r]=0;outr[r]=0;st[r]=0; }
+        ds4_gpu_tp_shards_release_all();
+    }
+
+    /* ===== ROW-PARALLEL via the resident row-shard cache ===== */
+    double rel_row = 1.0;
+    if (ok) {
+        for (int r=0;r<k && ok;r++) {
+            ok = cudaSetDevice(r)==cudaSuccess && cudaStreamCreate(&st[r])==cudaSuccess;
+            ok = ok && ds4_gpu_cache_row_shard(model_map, model_size, weight_offset, in_dim, out_dim, r, k, "shardjig_row")!=0;
+            ok = ok && cudaMalloc(&xqr[r],bpr*32)==cudaSuccess && cudaMalloc(&xsr[r],bpr*4)==cudaSuccess
+                    && cudaMalloc(&outr[r],out_dim*4)==cudaSuccess;
+            ok = ok && cudaMemcpyPeer(xqr[r],r,xqA+(uint64_t)r*bpr*32,0,bpr*32)==cudaSuccess;
+            ok = ok && cudaMemcpyPeer(xsr[r],r,xsA+(uint64_t)r*bpr,0,bpr*4)==cudaSuccess;
+        }
+        for (int r=0;r<k && ok;r++) {
+            ok = cudaSetDevice(r)==cudaSuccess;
+            int kind=-1; uint64_t so=0, si=0, sb=0;
+            const char *sh = cuda_tp_shard_ptr(model_map, weight_offset, &kind, &so, &si, &sb);
+            ok = ok && sh!=NULL && kind==DS4_TP_SHARD_ROW && so==out_dim && si==bpr*32 && sb==bpr;
+            if (ok) matmul_q8_0_preq_warp8_kernel<<<((unsigned)out_dim+7u)/8u,256,0,st[r]>>>(outr[r],(const unsigned char*)sh,xqr[r],xsr[r],si,so,sb,dp4a);
+        }
+        for (int r=0;r<k && ok;r++){ cudaSetDevice(r); ok = cudaStreamSynchronize(st[r])==cudaSuccess; }
+        if (ok) ok = ds4_gpu_tp_all_reduce_f32(devs,k,outr,(uint32_t)out_dim)!=0;
+        std::vector<float> hR(out_dim);
+        if (ok) { cudaSetDevice(0); ok = cudaMemcpy(hR.data(),outr[0],out_dim*4,cudaMemcpyDeviceToHost)==cudaSuccess; }
+        if (ok) { double maxabs=0,scale=0; for(uint64_t i=0;i<out_dim;i++){double a=fabs((double)hF[i]);if(a>scale)scale=a;double d=fabs((double)hF[i]-(double)hR[i]);if(d>maxabs)maxabs=d;} if(scale<1e-12)scale=1e-12; rel_row=maxabs/scale; }
+        for (int r=0;r<k;r++){ cudaSetDevice(r); if(xqr[r])cudaFree(xqr[r]); if(xsr[r])cudaFree(xsr[r]); if(outr[r])cudaFree(outr[r]); if(st[r])cudaStreamDestroy(st[r]); xqr[r]=0;xsr[r]=0;outr[r]=0;st[r]=0; }
+        ds4_gpu_tp_shards_release_all();
+    }
+
+    fprintf(stderr, "ds4: TP shard jig k=%d in=%llu out=%llu | col(resident) %s rel=%.2e | row(resident) %s rel=%.2e\n",
+            k, (unsigned long long)in_dim, (unsigned long long)out_dim,
+            rel_col<1e-3?"PASS":"FAIL", rel_col, rel_row<1e-3?"PASS":"FAIL", rel_row);
+
+    cudaSetDevice(0); if(x)cudaFree(x); if(xqA)cudaFree(xqA); if(xsA)cudaFree(xsA); if(outF)cudaFree(outF);
+    (void)cudaSetDevice(saved);
+    return (ok && rel_col<1e-3 && rel_row<1e-3) ? 1 : 0;
 }
 
 extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(

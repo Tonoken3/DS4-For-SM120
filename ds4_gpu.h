@@ -942,6 +942,26 @@ int ds4_gpu_tp_ffn_jig(
         uint64_t gate_off, uint64_t up_off, uint64_t down_off,
         uint64_t in_dim, uint64_t ff_dim, float clamp, int k);
 
+/* ---- Tensor-Parallel resident weight shards ----
+ * Cache one TP rank's shard of a Q8_0 [in_dim->out_dim] weight on the CURRENT
+ * device. COL = contiguous output-row slice (column-parallel); ROW = packed
+ * input-block slice (row-parallel). Resolved at decode time by parent
+ * (model_map, offset) on the current device, kept separate from the full-tensor
+ * cache so non-TP paths are unaffected. */
+int ds4_gpu_cache_col_shard(const void *model_map, uint64_t model_size,
+                            uint64_t offset, uint64_t in_dim, uint64_t out_dim,
+                            int rank, int k, const char *label);
+int ds4_gpu_cache_row_shard(const void *model_map, uint64_t model_size,
+                            uint64_t offset, uint64_t in_dim, uint64_t out_dim,
+                            int rank, int k, const char *label);
+void ds4_gpu_tp_shards_release_all(void);
+
+/* TP resident-shard jig: validates the build-time shard-cache -> accessor ->
+ * matmul path (col + row parallel) reproduces the single-GPU golden. */
+int ds4_gpu_tp_shard_jig(
+        const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, int k);
+
 int ds4_gpu_pp_event_record(int gpu);
 int ds4_gpu_pp_stream_wait_event(int gpu, int event_gpu);
 void *ds4_gpu_pp_stream_get(int gpu);

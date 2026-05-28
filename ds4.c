@@ -16901,6 +16901,11 @@ static void ds4_tp_matmul_selftest(const ds4_model *model, const ds4_weights *we
     (void)ds4_gpu_tp_matmul_jig(model->map, model->size, w->abs_offset, in_dim, out_dim, 2);
     (void)ds4_gpu_tp_matmul_jig(model->map, model->size, w->abs_offset, in_dim, out_dim, 4);
 
+    /* TP resident-shard jig: exercises the build-time shard-cache path (the one
+     * the TP decode integration will use) vs golden, for TP degree 2 (and 4). */
+    (void)ds4_gpu_tp_shard_jig(model->map, model->size, w->abs_offset, in_dim, out_dim, 2);
+    (void)ds4_gpu_tp_shard_jig(model->map, model->size, w->abs_offset, in_dim, out_dim, 4);
+
     /* TP FFN-block jig: full SwiGLU MLP (shared expert) col->swiglu->row->all-reduce. */
     const ds4_tensor *gsx = weights->layer[0].ffn_gate_shexp;
     const ds4_tensor *usx = weights->layer[0].ffn_up_shexp;

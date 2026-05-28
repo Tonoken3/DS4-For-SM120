@@ -16920,6 +16920,111 @@ static void ds4_tp_matmul_selftest(const ds4_model *model, const ds4_weights *we
     }
 }
 
+/* TP MoE expert-parallel validation (env DS4_CUDA_TP_MATMUL_SELFTEST): the routed
+ * MoE output is a weight*expert sum over the token's selected experts. Expert
+ * parallelism partitions the 256 experts across k ranks; each rank computes only
+ * the selected experts it owns and the partials are summed (all-reduce). This jig
+ * proves that split is numerically exact: run routed_moe over ALL selected experts
+ * (golden), then over each rank's owned id-range subset, sum the partials on the
+ * host, and compare. Uses layer 0's resident expert weights; no routed_moe change
+ * needed (the real integration adds an owned-expert-range mode + cross-GPU reduce).
+ * The cross-GPU all-reduce + the byte-identical expert shard are validated apart. */
+static void ds4_tp_moe_selftest(const ds4_model *model, const ds4_weights *weights) {
+    const ds4_layer_weights *L = &weights->layer[0];
+    const ds4_tensor *ge = L->ffn_gate_exps, *ue = L->ffn_up_exps, *de = L->ffn_down_exps;
+    if (!ge || !ue || !de) { fprintf(stderr, "ds4: TP MoE jig skipped (no routed experts)\n"); return; }
+    const uint32_t n_total = (uint32_t)DS4_N_EXPERT;
+    const uint64_t expert_in_dim  = ge->dim[0];   /* n_embd        */
+    const uint64_t expert_mid_dim = de->dim[0];   /* ff_exp (down in) */
+    const uint64_t out_dim        = de->dim[1];   /* n_embd        */
+    const uint64_t gate_row_bytes  = routed_expert_row_bytes(ge);
+    const uint64_t gate_expert_bytes = ge->dim[1] * gate_row_bytes;
+    const uint64_t down_row_bytes  = routed_expert_row_bytes(de);
+    const uint64_t down_expert_bytes = out_dim * down_row_bytes;
+
+    const int k = 2;
+    const int n_sel = 8;
+    int32_t sel[8]; float wt[8];
+    for (int i = 0; i < n_sel; i++) {
+        /* spread the selection across both id-halves so each rank owns some */
+        uint32_t e = (uint32_t)((i % k) * (n_total / (uint32_t)k) + (uint32_t)(i / k) * 7u + 3u);
+        sel[i] = (int32_t)(e < n_total ? e : n_total - 1u);
+        wt[i] = 0.05f + 0.1f * (float)i;
+    }
+
+    ds4_gpu_pp_set_device(0);
+    ds4_gpu_tensor *x    = ds4_gpu_tensor_alloc(expert_in_dim * sizeof(float));
+    ds4_gpu_tensor *tsel = ds4_gpu_tensor_alloc((uint64_t)n_sel * sizeof(int32_t));
+    ds4_gpu_tensor *twt  = ds4_gpu_tensor_alloc((uint64_t)n_sel * sizeof(float));
+    ds4_gpu_tensor *gscr = ds4_gpu_tensor_alloc((uint64_t)n_sel * expert_mid_dim * sizeof(float));
+    ds4_gpu_tensor *uscr = ds4_gpu_tensor_alloc((uint64_t)n_sel * expert_mid_dim * sizeof(float));
+    ds4_gpu_tensor *mscr = ds4_gpu_tensor_alloc((uint64_t)n_sel * expert_mid_dim * sizeof(float));
+    ds4_gpu_tensor *dscr = ds4_gpu_tensor_alloc((uint64_t)n_sel * out_dim * sizeof(float));
+    ds4_gpu_tensor *oout = ds4_gpu_tensor_alloc(out_dim * sizeof(float));
+    float *hx = (float *)malloc(expert_in_dim * sizeof(float));
+    float *hF = (float *)malloc(out_dim * sizeof(float));
+    float *hP = (float *)malloc(out_dim * sizeof(float));
+    float *hSum = (float *)calloc(out_dim, sizeof(float));
+    int ok = x && tsel && twt && gscr && uscr && mscr && dscr && oout && hx && hF && hP && hSum;
+
+#define MOE_JIG_RUN(nexp) ds4_gpu_routed_moe_one_tensor(oout, gscr, uscr, mscr, dscr, \
+        model->map, model->size, ge->abs_offset, ue->abs_offset, de->abs_offset, \
+        ge->type, de->type, gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes, \
+        (uint32_t)expert_in_dim, (uint32_t)expert_mid_dim, (uint32_t)out_dim, \
+        tsel, twt, n_total, (uint32_t)(nexp), DS4_SWIGLU_CLAMP_EXP, x)
+
+    if (ok) { for (uint64_t i = 0; i < expert_in_dim; i++) hx[i] = sinf((float)i * 0.017f) * 0.3f;
+              ok = ds4_gpu_tensor_write(x, 0, hx, expert_in_dim * sizeof(float)) != 0; }
+    /* golden: all selected experts */
+    if (ok) ok = ds4_gpu_tensor_write(tsel, 0, sel, (uint64_t)n_sel * sizeof(int32_t)) != 0;
+    if (ok) ok = ds4_gpu_tensor_write(twt,  0, wt,  (uint64_t)n_sel * sizeof(float)) != 0;
+    if (ok) ok = MOE_JIG_RUN(n_sel) != 0;
+    if (ok) ok = ds4_gpu_synchronize() != 0;
+    if (ok) ok = ds4_gpu_tensor_read(oout, 0, hF, out_dim * sizeof(float)) != 0;
+
+    /* per-rank partials over owned id-ranges, summed on the host */
+    const uint32_t ec = n_total / (uint32_t)k;
+    for (int r = 0; r < k && ok; r++) {
+        int32_t selr[8]; float wtr[8]; int nr = 0;
+        uint32_t e0 = (uint32_t)r * ec, e1 = e0 + ec;
+        for (int i = 0; i < n_sel; i++) {
+            if ((uint32_t)sel[i] >= e0 && (uint32_t)sel[i] < e1) { selr[nr] = sel[i]; wtr[nr] = wt[i]; nr++; }
+        }
+        if (nr == 0) continue;
+        ok = ds4_gpu_tensor_write(tsel, 0, selr, (uint64_t)nr * sizeof(int32_t)) != 0 &&
+             ds4_gpu_tensor_write(twt,  0, wtr,  (uint64_t)nr * sizeof(float)) != 0;
+        if (ok) ok = MOE_JIG_RUN(nr) != 0;
+        if (ok) ok = ds4_gpu_synchronize() != 0;
+        if (ok) ok = ds4_gpu_tensor_read(oout, 0, hP, out_dim * sizeof(float)) != 0;
+        if (ok) for (uint64_t i = 0; i < out_dim; i++) hSum[i] += hP[i];
+    }
+#undef MOE_JIG_RUN
+
+    double maxabs = 0.0, scale = 0.0, rel = 1.0;
+    if (ok) {
+        for (uint64_t i = 0; i < out_dim; i++) {
+            double a = fabs((double)hF[i]); if (a > scale) scale = a;
+            double d = fabs((double)hF[i] - (double)hSum[i]); if (d > maxabs) maxabs = d;
+        }
+        if (scale < 1e-12) scale = 1e-12;
+        rel = maxabs / scale;
+    }
+    fprintf(stderr, "ds4: TP MoE expert-parallel jig k=%d n_sel=%d experts=%u in=%llu mid=%llu out=%llu | %s rel=%.2e\n",
+            k, n_sel, n_total, (unsigned long long)expert_in_dim,
+            (unsigned long long)expert_mid_dim, (unsigned long long)out_dim,
+            (ok && rel < 1e-3) ? "PASS" : "FAIL", rel);
+
+    free(hx); free(hF); free(hP); free(hSum);
+    if (x) ds4_gpu_tensor_free(x);
+    if (tsel) ds4_gpu_tensor_free(tsel);
+    if (twt) ds4_gpu_tensor_free(twt);
+    if (gscr) ds4_gpu_tensor_free(gscr);
+    if (uscr) ds4_gpu_tensor_free(uscr);
+    if (mscr) ds4_gpu_tensor_free(mscr);
+    if (dscr) ds4_gpu_tensor_free(dscr);
+    if (oout) ds4_gpu_tensor_free(oout);
+}
+
 /* Metal generation entry point.  The model runs as one local whole-graph
  * pipeline: chunked/layer-major prefill followed by graph decode steps. */
 static int generate_metal_graph_raw_swa(
@@ -17165,7 +17270,10 @@ static int generate_metal_graph_raw_swa(
         }
     }
 
-    if (getenv("DS4_CUDA_TP_MATMUL_SELFTEST") != NULL) ds4_tp_matmul_selftest(model, weights);
+    if (getenv("DS4_CUDA_TP_MATMUL_SELFTEST") != NULL) {
+        ds4_tp_matmul_selftest(model, weights);
+        ds4_tp_moe_selftest(model, weights);
+    }
 
     int pos = prompt->len;
     int n_generated = 0;

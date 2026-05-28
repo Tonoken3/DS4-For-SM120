@@ -16896,9 +16896,10 @@ static void ds4_tp_matmul_selftest(const ds4_model *model, const ds4_weights *we
     if (out_full) ds4_gpu_tensor_free(out_full);
     if (out_tp) ds4_gpu_tensor_free(out_tp);
 
-    /* Cross-GPU column-parallel TP matmul on the same real weight (2 GPUs). */
-    (void)ds4_gpu_tp_xgpu_colparallel_selftest(model->map, model->size,
-                                               w->abs_offset, in_dim, out_dim);
+    /* TP matmul jig on the same real weight: col/row parallel vs golden, with
+     * timing, for TP degree 2 (and 4 if enough GPUs). */
+    (void)ds4_gpu_tp_matmul_jig(model->map, model->size, w->abs_offset, in_dim, out_dim, 2);
+    (void)ds4_gpu_tp_matmul_jig(model->map, model->size, w->abs_offset, in_dim, out_dim, 4);
 }
 
 /* Metal generation entry point.  The model runs as one local whole-graph

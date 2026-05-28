@@ -902,6 +902,17 @@ int ds4_gpu_pp_work_streams_enable(int enable);
 int ds4_gpu_pp_ngpu(void);
 int ds4_gpu_pp_layer_start(int g);
 int ds4_gpu_pp_layer_end(int g);
+
+/* Tensor-Parallel topology (set via env DS4_CUDA_TP). g_tp_degree ranks
+ * cooperate per layer; nstage = ngpu/tp pipeline stages; logical device g is
+ * stage g/tp, rank g%tp. All return PP-equivalent values when TP is off. */
+int ds4_gpu_tp_enabled(void);
+int ds4_gpu_tp_degree(void);
+int ds4_gpu_tp_rank(int g);
+int ds4_gpu_tp_stage(int g);
+int ds4_gpu_tp_nstage(void);
+int ds4_gpu_tp_stage_dev0(int s);
+
 void *ds4_gpu_pp_active_ptr(int g);
 int ds4_gpu_pp_p2p_copy(int dst_gpu, int src_gpu);
 int ds4_gpu_pp_p2p_copy_ptr(int dst_gpu, int src_gpu,
@@ -954,6 +965,11 @@ int ds4_gpu_cache_col_shard(const void *model_map, uint64_t model_size,
 int ds4_gpu_cache_row_shard(const void *model_map, uint64_t model_size,
                             uint64_t offset, uint64_t in_dim, uint64_t out_dim,
                             int rank, int k, const char *label);
+/* Expert-parallel shard of a routed-expert 3D tensor (any quant): rank r owns
+ * the contiguous expert subset [r*n_expert/k, ...). */
+int ds4_gpu_cache_expert_shard(const void *model_map, uint64_t model_size,
+                               uint64_t offset, uint64_t total_bytes, uint64_t n_expert,
+                               int rank, int k, const char *label);
 void ds4_gpu_tp_shards_release_all(void);
 
 /* TP resident-shard jig: validates the build-time shard-cache -> accessor ->
@@ -961,6 +977,13 @@ void ds4_gpu_tp_shards_release_all(void);
 int ds4_gpu_tp_shard_jig(
         const void *model_map, uint64_t model_size,
         uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, int k);
+
+/* Validate the RESIDENT shared-FFN shards built by the TP-aware cache loop vs a
+ * host-weight golden, across a stage's k ranks (stage_dev0..stage_dev0+k-1). */
+int ds4_gpu_tp_resident_ffn_check(
+        const void *model_map, uint64_t model_size,
+        uint64_t gate_off, uint64_t up_off, uint64_t down_off,
+        uint64_t in_dim, uint64_t ff_dim, float clamp, int stage_dev0, int k);
 
 int ds4_gpu_pp_event_record(int gpu);
 int ds4_gpu_pp_stream_wait_event(int gpu, int event_gpu);

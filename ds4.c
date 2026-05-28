@@ -17034,26 +17034,83 @@ static int generate_metal_graph_raw_swa(
                             pos2++;
                         }
                     }
-                    /* Non-layer weights: GPU 0 always caches. Last GPU also caches
-                     * output head weights so it can run output_head locally. */
+                    /* Non-layer weights: GPU 0 caches the input-side weights
+                     * (token_embd, global norms); the last GPU caches the output
+                     * head so it can run output_head locally. In TP mode skip the
+                     * redundant output-head copy on GPU 0 (it never computes
+                     * logits) to save VRAM. */
                     int is_output_weight = (t->name.len >= 6 &&
                         (memcmp(t->name.ptr, "output", 6) == 0));
-                    if (bl < 0 && g != 0 && !(g == ngpu - 1 && is_output_weight)) continue;
+                    if (bl < 0) {
+                        int keep;
+                        if (is_output_weight) {
+                            keep = (g == ngpu - 1) || (!ds4_gpu_tp_enabled() && g == 0);
+                        } else {
+                            keep = (g == 0);
+                        }
+                        if (!keep) continue;
+                    }
                     if (bl >= 0 && (bl < l0 || bl > l1)) continue;
                     char label[128];
                     snprintf(label, sizeof(label), "pp:%.*s", (int)(t->name.len > 120 ? 120 : t->name.len), t->name.ptr);
-                    if (ds4_gpu_cache_model_range_force(model->map, model->size,
+                    /* Tensor-Parallel: shard the bandwidth-heavy layer weights so
+                     * each rank holds only its slice. Shared-expert FFN: gate/up
+                     * column-parallel, down row-parallel. Routed experts:
+                     * expert-parallel (contiguous expert subset). Everything else
+                     * (attention, norms, router) stays replicated on every rank. */
+                    int tp = ds4_gpu_tp_degree();
+                    int sharded = 0;
+                    if (tp > 1 && bl >= 0 && t->ndim >= 2) {
+                        int rank = ds4_gpu_tp_rank(g);
+                        if (ds4_str_contains(t->name, "shexp")) {
+                            uint64_t in_dim = t->dim[0], out_dim = t->dim[1];
+                            if (ds4_str_contains(t->name, "down_shexp")) {
+                                sharded = ds4_gpu_cache_row_shard(model->map, model->size,
+                                        t->abs_offset, in_dim, out_dim, rank, tp, label);
+                            } else {
+                                sharded = ds4_gpu_cache_col_shard(model->map, model->size,
+                                        t->abs_offset, in_dim, out_dim, rank, tp, label);
+                            }
+                        } else if (ds4_str_contains(t->name, "exps")) {
+                            uint64_t n_expert = (t->ndim >= 3) ? t->dim[t->ndim - 1] : (uint64_t)DS4_N_EXPERT;
+                            sharded = ds4_gpu_cache_expert_shard(model->map, model->size,
+                                    t->abs_offset, t->bytes, n_expert, rank, tp, label);
+                        }
+                        if (sharded) total_cached += t->bytes / (uint64_t)tp;
+                    }
+                    if (!sharded &&
+                        ds4_gpu_cache_model_range_force(model->map, model->size,
                                                         t->abs_offset, t->bytes, label)) {
                         total_cached += t->bytes;
                     }
                 }
         ds4_gpu_end_commands();
-        fprintf(stderr, "ds4: PP GPU %d: layers %d-%d cached\n", g, l0, l1);
+        fprintf(stderr, "ds4: PP %s %d: layers %d-%d %s\n",
+                ds4_gpu_tp_enabled() ? "stage/rank" : "GPU", g, l0, l1,
+                ds4_gpu_tp_enabled() ? "sharded" : "cached");
     }
     ds4_gpu_pp_set_device(0);
     fprintf(stderr, "ds4: PP weight cache done, %.2f GiB total\n",
             (double)total_cached / 1073741824.0);
     ds4_gpu_model_range_reserve();
+        }
+        /* TP build-only validation: confirm the resident shared-FFN shards built
+         * by the TP-aware loop reproduce the host golden, then stop (the decode
+         * encode is not TP-aware yet — that is the next integration brick). */
+        if (ds4_gpu_tp_enabled() && getenv("DS4_CUDA_TP_VALIDATE") != NULL) {
+            const ds4_tensor *gsx = weights->layer[0].ffn_gate_shexp;
+            const ds4_tensor *usx = weights->layer[0].ffn_up_shexp;
+            const ds4_tensor *dsx = weights->layer[0].ffn_down_shexp;
+            if (gsx && usx && dsx && gsx->ndim == 2) {
+                (void)ds4_gpu_tp_resident_ffn_check(model->map, model->size,
+                        gsx->abs_offset, usx->abs_offset, dsx->abs_offset,
+                        gsx->dim[0], gsx->dim[1], DS4_SWIGLU_CLAMP_EXP,
+                        ds4_gpu_tp_stage_dev0(0), ds4_gpu_tp_degree());
+            }
+            fprintf(stderr, "ds4: TP validate complete; exiting before (not-yet-TP-aware) decode\n");
+            free(logits);
+            metal_graph_free(&g);
+            return 0;
         }
         ds4_gpu_pp_enable_decode();
         ds4_gpu_pp_work_streams_enable(

@@ -541,8 +541,9 @@ struct cuda_q8_f32_range {
  * Each (stage,rank) device holds exactly its own shard of a sharded weight; the
  * TP encode resolves it by (parent offset, current device) via cuda_tp_shard_ptr. */
 enum cuda_tp_shard_kind {
-    DS4_TP_SHARD_COL = 0,   /* contiguous output-row slice (column-parallel) */
-    DS4_TP_SHARD_ROW = 1,   /* packed input-block slice    (row-parallel)    */
+    DS4_TP_SHARD_COL = 0,    /* contiguous output-row slice (column-parallel)  */
+    DS4_TP_SHARD_ROW = 1,    /* packed input-block slice    (row-parallel)     */
+    DS4_TP_SHARD_EXPERT = 2, /* contiguous expert subset    (expert-parallel)  */
 };
 struct cuda_tp_shard {
     const void *host_base;  /* model_map of the parent tensor                  */
@@ -556,6 +557,9 @@ struct cuda_tp_shard {
     uint64_t out_dim;       /* COL: rows on this rank; ROW: full out_dim       */
     uint64_t in_dim;        /* COL: full in_dim; ROW: this rank's in (bpr*32)  */
     uint64_t blocks;        /* COL: full blocks; ROW: this rank's blocks (bpr) */
+    uint64_t expert_base;   /* EXPERT: global id of first owned expert         */
+    uint64_t expert_count;  /* EXPERT: experts owned by this rank              */
+    uint64_t expert_bytes;  /* EXPERT: bytes per single expert                 */
 };
 
 static std::vector<cuda_model_range> g_model_ranges;
@@ -590,6 +594,10 @@ static int g_pp_ngpu;
 static int g_pp_requested;
 static int g_pp_topology_ready;
 static int g_pp_resident_ready;
+/* Tensor-Parallel (TP) over PP stages: g_tp_degree logical devices cooperate on
+ * each layer. Logical device g -> stage g/g_tp_degree, rank g%g_tp_degree. When
+ * g_tp_degree<=1, TP is OFF and the PP path is byte-for-byte unchanged. */
+static int g_tp_degree;
 static int g_pp_layer_start[7];
 static int g_pp_layer_end[7];
 static float *g_pp_active[7];
@@ -2090,45 +2098,68 @@ static int ds4_gpu_pp_init(void) {
     }
     if (!ok) { g_pp_ngpu = 0; return 0; }
 
+    /* Tensor parallelism degree: g_tp ranks cooperate per layer. The model is
+     * split into nstage = ngpu/g_tp pipeline stages; within a stage every rank
+     * holds the SAME layer range (its own weight shards). g_tp=1 => pure PP. */
+    int g_tp = 1;
+    {
+        const char *tp_env = getenv("DS4_CUDA_TP");
+        if (tp_env && tp_env[0]) {
+            int v = (int)strtol(tp_env, NULL, 10);
+            if (v >= 2 && (ngpu % v) == 0) {
+                g_tp = v;
+            } else if (v >= 2) {
+                fprintf(stderr, "ds4: DS4_CUDA_TP=%d but ngpu=%d not divisible; TP disabled\n", v, ngpu);
+            }
+        }
+    }
+    g_tp_degree = g_tp;
+    const int nstage = ngpu / g_tp;
+
     int total_layers = 43;
     const char *split_env = getenv("DS4_CUDA_PP_LAYER_SPLIT");
-    int il = 0;
+    int stage_start[16] = {0}, stage_end[16] = {0};
+    int have_split = 0;
     if (split_env && split_env[0]) {
-        /* Custom split: comma-separated start layers, e.g. "0,5,11,17,23,29,35"
-         * Each value is the start layer for that GPU. Must have ngpu values. */
-        int custom_start[7] = {0};
+        /* Custom split: comma-separated start layers, one per STAGE (== per GPU
+         * when g_tp=1). e.g. TP2xPP3 6-GPU: "0,15,29" (3 stage starts). */
+        int custom_start[16] = {0};
         int n_parsed = 0;
         const char *p = split_env;
-        while (*p && n_parsed < ngpu) {
+        while (*p && n_parsed < nstage) {
             custom_start[n_parsed] = (int)strtol(p, NULL, 10);
             n_parsed++;
             while (*p && *p != ',') p++;
             if (*p == ',') p++;
         }
-        if (n_parsed == ngpu) {
-            for (int g = 0; g < ngpu; g++) {
-                g_pp_layer_start[g] = custom_start[g];
-                if (g + 1 < ngpu) {
-                    g_pp_layer_end[g] = custom_start[g + 1] - 1;
-                } else {
-                    g_pp_layer_end[g] = total_layers - 1;
-                }
+        if (n_parsed == nstage) {
+            for (int s = 0; s < nstage; s++) {
+                stage_start[s] = custom_start[s];
+                stage_end[s] = (s + 1 < nstage) ? custom_start[s + 1] - 1 : total_layers - 1;
             }
-            fprintf(stderr, "ds4: PP custom layer split: %s\n", split_env);
+            have_split = 1;
+            fprintf(stderr, "ds4: PP%s layer split (%d stages): %s\n",
+                    g_tp > 1 ? "/TP" : "", nstage, split_env);
         } else {
-            fprintf(stderr, "ds4: PP_LAYER_SPLIT expected %d values, got %d; using default\n", ngpu, n_parsed);
-            split_env = NULL;
+            fprintf(stderr, "ds4: PP_LAYER_SPLIT expected %d values (stages), got %d; using default\n",
+                    nstage, n_parsed);
         }
     }
-    if (!split_env || !split_env[0]) {
-        int per_gpu = total_layers / ngpu;
-        int rem = total_layers % ngpu;
-        for (int g = 0; g < ngpu; g++) {
-            g_pp_layer_start[g] = il;
-            int n = per_gpu + (g < rem ? 1 : 0);
-            g_pp_layer_end[g] = il + n - 1;
+    if (!have_split) {
+        int per_stage = total_layers / nstage;
+        int rem = total_layers % nstage;
+        int il = 0;
+        for (int s = 0; s < nstage; s++) {
+            stage_start[s] = il;
+            int n = per_stage + (s < rem ? 1 : 0);
+            stage_end[s] = il + n - 1;
             il += n;
         }
+    }
+    for (int g = 0; g < ngpu; g++) {
+        int s = g / g_tp;
+        g_pp_layer_start[g] = stage_start[s];
+        g_pp_layer_end[g] = stage_end[s];
     }
     for (int g = 0; g < ngpu; g++) {
         cudaSetDevice(g);
@@ -2174,9 +2205,15 @@ static int ds4_gpu_pp_init(void) {
             g_pp_decode_active = 1;
         }
         int n0 = g_pp_layer_end[0] - g_pp_layer_start[0] + 1;
-        fprintf(stderr, "ds4: PP=%d ready (%d layers/GPU, GPU0: L%d-%d%s)\n",
-                ngpu, n0, g_pp_layer_start[0], g_pp_layer_end[0],
-                delayed ? ", delayed resident" : "");
+        if (g_tp_degree > 1) {
+            fprintf(stderr, "ds4: TP%dxPP%d ready (%d GPUs, %d stages, stage0/rank0: L%d-%d%s)\n",
+                    g_tp_degree, nstage, ngpu, nstage, g_pp_layer_start[0], g_pp_layer_end[0],
+                    delayed ? ", delayed resident" : "");
+        } else {
+            fprintf(stderr, "ds4: PP=%d ready (%d layers/GPU, GPU0: L%d-%d%s)\n",
+                    ngpu, n0, g_pp_layer_start[0], g_pp_layer_end[0],
+                    delayed ? ", delayed resident" : "");
+        }
         if (getenv("DS4_CUDA_TP_SELFTEST") != NULL) (void)ds4_gpu_tp_selftest(ngpu);
     }
     return ok ? 1 : 0;
@@ -2201,6 +2238,15 @@ extern "C" int ds4_gpu_pp_work_streams_enable(int enable) {
 extern "C" int ds4_gpu_pp_ngpu(void) { return g_pp_ngpu; }
 extern "C" int ds4_gpu_pp_layer_start(int g) { return (g >= 0 && g < g_pp_ngpu) ? g_pp_layer_start[g] : -1; }
 extern "C" int ds4_gpu_pp_layer_end(int g) { return (g >= 0 && g < g_pp_ngpu) ? g_pp_layer_end[g] : -1; }
+
+/* Tensor-Parallel topology accessors. g_tp_degree<=1 => TP off (rank 0, one
+ * rank per stage, stage == logical GPU). */
+extern "C" int ds4_gpu_tp_enabled(void) { return g_tp_degree > 1; }
+extern "C" int ds4_gpu_tp_degree(void) { return g_tp_degree > 1 ? g_tp_degree : 1; }
+extern "C" int ds4_gpu_tp_rank(int g) { return g_tp_degree > 1 ? (g % g_tp_degree) : 0; }
+extern "C" int ds4_gpu_tp_stage(int g) { return g_tp_degree > 1 ? (g / g_tp_degree) : g; }
+extern "C" int ds4_gpu_tp_nstage(void) { return g_tp_degree > 1 ? (g_pp_ngpu / g_tp_degree) : g_pp_ngpu; }
+extern "C" int ds4_gpu_tp_stage_dev0(int s) { return g_tp_degree > 1 ? (s * g_tp_degree) : s; }
 extern "C" void *ds4_gpu_pp_active_ptr(int g) { return (g >= 0 && g < g_pp_ngpu) ? g_pp_active[g] : NULL; }
 extern "C" int ds4_gpu_pp_p2p_copy(int dst_gpu, int src_gpu) {
     if (dst_gpu < 0 || dst_gpu >= g_pp_ngpu || src_gpu < 0 || src_gpu >= g_pp_ngpu) return 0;
@@ -2547,6 +2593,7 @@ extern "C" int ds4_gpu_cache_col_shard(
     s.host_base = model_map; s.offset = offset; s.rank = rank; s.k = k;
     s.kind = DS4_TP_SHARD_COL; s.device = cur; s.device_ptr = (char *)dev; s.bytes = shard_bytes;
     s.out_dim = rpr; s.in_dim = in_dim; s.blocks = blocks;
+    s.expert_base = 0; s.expert_count = 0; s.expert_bytes = 0;
     g_tp_shards.push_back(s);
     g_tp_shard_bytes += shard_bytes;
     return 1;
@@ -2596,9 +2643,73 @@ extern "C" int ds4_gpu_cache_row_shard(
     s.host_base = model_map; s.offset = offset; s.rank = rank; s.k = k;
     s.kind = DS4_TP_SHARD_ROW; s.device = cur; s.device_ptr = (char *)dev; s.bytes = shard_bytes;
     s.out_dim = out_dim; s.in_dim = bpr * 32; s.blocks = bpr;
+    s.expert_base = 0; s.expert_count = 0; s.expert_bytes = 0;
     g_tp_shards.push_back(s);
     g_tp_shard_bytes += shard_bytes;
     return 1;
+}
+
+/* Cache an EXPERT-parallel shard of a routed-expert 3D tensor (any quant type)
+ * on the current device: rank r owns the contiguous expert range
+ * [r*ec,(r+1)*ec), ec=n_expert/k. Experts are the outermost (slowest) dim, so a
+ * single expert is a contiguous byte block (total_bytes/n_expert) and the owned
+ * range is one contiguous H2D copy. Format-agnostic (Q2_K / IQ2_XXS / ...). */
+extern "C" int ds4_gpu_cache_expert_shard(
+        const void *model_map, uint64_t model_size,
+        uint64_t offset, uint64_t total_bytes, uint64_t n_expert,
+        int rank, int k, const char *label) {
+    if (!model_map || total_bytes == 0 || n_expert == 0 || k < 1 || rank < 0 || rank >= k) return 0;
+    if ((n_expert % (uint64_t)k) != 0 || (total_bytes % n_expert) != 0) {
+        fprintf(stderr, "ds4: expert-shard %s: n_expert(%llu)/bytes(%llu) not splittable by k=%d\n",
+                label ? label : "?", (unsigned long long)n_expert,
+                (unsigned long long)total_bytes, k);
+        return 0;
+    }
+    const uint64_t bpe = total_bytes / n_expert;
+    const uint64_t ec = n_expert / (uint64_t)k;
+    const uint64_t e0 = (uint64_t)rank * ec;
+    const uint64_t shard_bytes = ec * bpe;
+    const uint64_t src_off = offset + e0 * bpe;
+    if (src_off > model_size || shard_bytes > model_size - src_off) return 0;
+    void *dev = NULL;
+    cudaError_t err = cudaMalloc(&dev, (size_t)shard_bytes);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        fprintf(stderr, "ds4: expert-shard %s alloc failed (%.2f MiB): %s\n",
+                label ? label : "?", (double)shard_bytes / 1048576.0, cudaGetErrorString(err));
+        return 0;
+    }
+    err = cudaMemcpy(dev, (const char *)model_map + src_off, (size_t)shard_bytes, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "ds4: expert-shard %s copy failed: %s\n", label ? label : "?", cudaGetErrorString(err));
+        (void)cudaFree(dev); (void)cudaGetLastError();
+        return 0;
+    }
+    int cur = -1; (void)cudaGetDevice(&cur);
+    cuda_tp_shard s;
+    s.host_base = model_map; s.offset = offset; s.rank = rank; s.k = k;
+    s.kind = DS4_TP_SHARD_EXPERT; s.device = cur; s.device_ptr = (char *)dev; s.bytes = shard_bytes;
+    s.out_dim = 0; s.in_dim = 0; s.blocks = 0;
+    s.expert_base = e0; s.expert_count = ec; s.expert_bytes = bpe;
+    g_tp_shards.push_back(s);
+    g_tp_shard_bytes += shard_bytes;
+    return 1;
+}
+
+/* Resolve an EXPERT shard for the current device; fills expert base/count/bytes. */
+static const char *cuda_tp_expert_shard_ptr(const void *model_map, uint64_t offset,
+                                            uint64_t *e0, uint64_t *ec, uint64_t *bpe) {
+    int cur = -1; (void)cudaGetDevice(&cur);
+    for (const cuda_tp_shard &s : g_tp_shards) {
+        if (s.host_base == model_map && s.offset == offset && s.device == cur &&
+            s.kind == DS4_TP_SHARD_EXPERT) {
+            if (e0) *e0 = s.expert_base;
+            if (ec) *ec = s.expert_count;
+            if (bpe) *bpe = s.expert_bytes;
+            return s.device_ptr;
+        }
+    }
+    return NULL;
 }
 
 extern "C" void ds4_gpu_tp_shards_release_all(void) {
@@ -8108,6 +8219,103 @@ extern "C" int ds4_gpu_tp_shard_jig(
     cudaSetDevice(0); if(x)cudaFree(x); if(xqA)cudaFree(xqA); if(xsA)cudaFree(xsA); if(outF)cudaFree(outF);
     (void)cudaSetDevice(saved);
     return (ok && rel_col<1e-3 && rel_row<1e-3) ? 1 : 0;
+}
+
+/* Validate the RESIDENT shared-FFN shards built by the TP-aware cache loop:
+ * recompute the full SwiGLU MLP on stage_dev0 from the HOST weights (golden),
+ * then run it across the stage's k ranks reading their resident col/row shards
+ * via cuda_tp_shard_ptr, all-reduce, and compare. Proves the load-path sharding
+ * is numerically correct end-to-end (the data half of the TP integration).
+ * Returns 1 on PASS. */
+extern "C" int ds4_gpu_tp_resident_ffn_check(
+        const void *model_map, uint64_t model_size,
+        uint64_t gate_off, uint64_t up_off, uint64_t down_off,
+        uint64_t in_dim, uint64_t ff_dim, float clamp, int stage_dev0, int k) {
+    int ndev = 0; (void)cudaGetDeviceCount(&ndev);
+    if (k < 2 || k > 8 || stage_dev0 < 0 || stage_dev0 + k > ndev) return 0;
+    const uint64_t inb = (in_dim + 31) / 32, ffb = (ff_dim + 31) / 32;
+    const uint64_t gate_wb = ff_dim * inb * 34, down_wb = in_dim * ffb * 34;
+    if (gate_off + gate_wb > model_size || up_off + gate_wb > model_size || down_off + down_wb > model_size) return 0;
+    if ((ff_dim % (uint64_t)k) != 0 || (ffb % (uint64_t)k) != 0) return 0;
+    const int dp4a = cuda_q8_use_dp4a();
+    int saved = 0; (void)cudaGetDevice(&saved);
+    int ok = 1;
+
+    /* ---- golden full FFN on stage_dev0 (weights read straight from host) ---- */
+    if (cudaSetDevice(stage_dev0) != cudaSuccess) return 0;
+    char *gW=NULL,*uW=NULL,*dW=NULL;
+    ok = ok && cudaMalloc(&gW,gate_wb)==cudaSuccess && cudaMalloc(&uW,gate_wb)==cudaSuccess && cudaMalloc(&dW,down_wb)==cudaSuccess;
+    ok = ok && cudaMemcpy(gW,(const char*)model_map+gate_off,gate_wb,cudaMemcpyHostToDevice)==cudaSuccess;
+    ok = ok && cudaMemcpy(uW,(const char*)model_map+up_off,  gate_wb,cudaMemcpyHostToDevice)==cudaSuccess;
+    ok = ok && cudaMemcpy(dW,(const char*)model_map+down_off,down_wb,cudaMemcpyHostToDevice)==cudaSuccess;
+    float *x=NULL,*g=NULL,*u=NULL,*mid=NULL,*outF=NULL; int8_t *xq=NULL,*midq=NULL; float *xs=NULL,*mids=NULL;
+    std::vector<float> hx(in_dim); for (uint64_t i=0;i<in_dim;i++) hx[i]=sinf((float)i*0.009f)*0.4f;
+    ok = ok && cudaMalloc(&x,in_dim*4)==cudaSuccess && cudaMalloc(&xq,inb*32)==cudaSuccess && cudaMalloc(&xs,inb*4)==cudaSuccess
+            && cudaMalloc(&g,ff_dim*4)==cudaSuccess && cudaMalloc(&u,ff_dim*4)==cudaSuccess && cudaMalloc(&mid,ff_dim*4)==cudaSuccess
+            && cudaMalloc(&midq,ffb*32)==cudaSuccess && cudaMalloc(&mids,ffb*4)==cudaSuccess && cudaMalloc(&outF,in_dim*4)==cudaSuccess;
+    if (ok) ok = cudaMemcpy(x,hx.data(),in_dim*4,cudaMemcpyHostToDevice)==cudaSuccess;
+    if (ok) { quantize_q8_0_f32_kernel<<<(unsigned)inb,32>>>(xq,xs,x,in_dim,inb);
+              matmul_q8_0_preq_warp8_kernel<<<((unsigned)ff_dim+7u)/8u,256>>>(g,(const unsigned char*)gW,xq,xs,in_dim,ff_dim,inb,dp4a);
+              matmul_q8_0_preq_warp8_kernel<<<((unsigned)ff_dim+7u)/8u,256>>>(u,(const unsigned char*)uW,xq,xs,in_dim,ff_dim,inb,dp4a);
+              swiglu_kernel<<<((unsigned)ff_dim+255u)/256u,256>>>(mid,g,u,(uint32_t)ff_dim,clamp,1.0f);
+              quantize_q8_0_f32_kernel<<<(unsigned)ffb,32>>>(midq,mids,mid,ff_dim,ffb);
+              matmul_q8_0_preq_warp8_kernel<<<((unsigned)in_dim+7u)/8u,256>>>(outF,(const unsigned char*)dW,midq,mids,ff_dim,in_dim,ffb,dp4a);
+              ok = cudaDeviceSynchronize()==cudaSuccess && cudaGetLastError()==cudaSuccess; }
+    std::vector<float> hF(in_dim);
+    if (ok) ok = cudaMemcpy(hF.data(),outF,in_dim*4,cudaMemcpyDeviceToHost)==cudaSuccess;
+    if(gW)cudaFree(gW); if(uW)cudaFree(uW); if(dW)cudaFree(dW);
+
+    /* ---- TP across the stage's k ranks reading RESIDENT shards ---- */
+    const uint64_t ffpr = ff_dim/(uint64_t)k, bpr = ffb/(uint64_t)k;
+    int8_t *xqr[8]={0},*mqr[8]={0}; float *xsr[8]={0},*msr[8]={0};
+    float *gr[8]={0},*ur[8]={0},*mr[8]={0},*pr[8]={0}; cudaStream_t st[8]={0};
+    int devs[8]; for(int r=0;r<k;r++)devs[r]=stage_dev0+r;
+    double rel=1.0;
+    if (ok) {
+        for (int r=0;r<k && ok;r++) {
+            int dv=stage_dev0+r;
+            ok = cudaSetDevice(dv)==cudaSuccess && cudaStreamCreate(&st[r])==cudaSuccess;
+            ok = ok && cudaMalloc(&xqr[r],inb*32)==cudaSuccess && cudaMalloc(&xsr[r],inb*4)==cudaSuccess
+                    && cudaMalloc(&gr[r],ffpr*4)==cudaSuccess && cudaMalloc(&ur[r],ffpr*4)==cudaSuccess && cudaMalloc(&mr[r],ffpr*4)==cudaSuccess
+                    && cudaMalloc(&mqr[r],bpr*32)==cudaSuccess && cudaMalloc(&msr[r],bpr*4)==cudaSuccess && cudaMalloc(&pr[r],in_dim*4)==cudaSuccess;
+            ok = ok && cudaMemcpyPeer(xqr[r],dv,xq,stage_dev0,inb*32)==cudaSuccess;
+            ok = ok && cudaMemcpyPeer(xsr[r],dv,xs,stage_dev0,inb*4)==cudaSuccess;
+        }
+        for (int r=0;r<k && ok;r++) {
+            int dv=stage_dev0+r;
+            ok = cudaSetDevice(dv)==cudaSuccess;
+            int gk=-1,uk=-1,dk=-1; uint64_t go=0,gi=0,gb=0,uo=0,ui=0,ub=0,doo=0,di=0,db=0;
+            const char *gsh = cuda_tp_shard_ptr(model_map, gate_off, &gk, &go, &gi, &gb);
+            const char *ush = cuda_tp_shard_ptr(model_map, up_off,   &uk, &uo, &ui, &ub);
+            const char *dsh = cuda_tp_shard_ptr(model_map, down_off, &dk, &doo,&di, &db);
+            ok = ok && gsh && ush && dsh && gk==DS4_TP_SHARD_COL && uk==DS4_TP_SHARD_COL && dk==DS4_TP_SHARD_ROW
+                    && go==ffpr && uo==ffpr && doo==in_dim && db==bpr;
+            if (ok) {
+                matmul_q8_0_preq_warp8_kernel<<<((unsigned)ffpr+7u)/8u,256,0,st[r]>>>(gr[r],(const unsigned char*)gsh,xqr[r],xsr[r],in_dim,ffpr,inb,dp4a);
+                matmul_q8_0_preq_warp8_kernel<<<((unsigned)ffpr+7u)/8u,256,0,st[r]>>>(ur[r],(const unsigned char*)ush,xqr[r],xsr[r],in_dim,ffpr,inb,dp4a);
+                swiglu_kernel<<<((unsigned)ffpr+255u)/256u,256,0,st[r]>>>(mr[r],gr[r],ur[r],(uint32_t)ffpr,clamp,1.0f);
+                quantize_q8_0_f32_kernel<<<(unsigned)bpr,32,0,st[r]>>>(mqr[r],msr[r],mr[r],ffpr,bpr);
+                matmul_q8_0_preq_warp8_kernel<<<((unsigned)in_dim+7u)/8u,256,0,st[r]>>>(pr[r],(const unsigned char*)dsh,mqr[r],msr[r],ffpr,in_dim,bpr,dp4a);
+            }
+        }
+        for (int r=0;r<k && ok;r++){ cudaSetDevice(stage_dev0+r); ok = cudaStreamSynchronize(st[r])==cudaSuccess; }
+        if (ok) ok = ds4_gpu_tp_all_reduce_f32(devs,k,pr,(uint32_t)in_dim)!=0;
+        std::vector<float> hT(in_dim);
+        if (ok) { cudaSetDevice(stage_dev0); ok = cudaMemcpy(hT.data(),pr[0],in_dim*4,cudaMemcpyDeviceToHost)==cudaSuccess; }
+        if (ok) { double maxabs=0,scale=0; for(uint64_t i=0;i<in_dim;i++){double a=fabs((double)hF[i]);if(a>scale)scale=a;double d=fabs((double)hF[i]-(double)hT[i]);if(d>maxabs)maxabs=d;} if(scale<1e-12)scale=1e-12; rel=maxabs/scale; }
+        for (int r=0;r<k;r++){ cudaSetDevice(stage_dev0+r);
+            if(xqr[r])cudaFree(xqr[r]);if(xsr[r])cudaFree(xsr[r]);if(gr[r])cudaFree(gr[r]);if(ur[r])cudaFree(ur[r]);
+            if(mr[r])cudaFree(mr[r]);if(mqr[r])cudaFree(mqr[r]);if(msr[r])cudaFree(msr[r]);if(pr[r])cudaFree(pr[r]);
+            if(st[r])cudaStreamDestroy(st[r]); }
+    }
+    fprintf(stderr, "ds4: TP resident-FFN check stage_dev0=%d k=%d in=%llu ff=%llu | %s rel=%.2e\n",
+            stage_dev0, k, (unsigned long long)in_dim, (unsigned long long)ff_dim,
+            (ok && rel<1e-3)?"PASS":"FAIL", rel);
+    cudaSetDevice(stage_dev0);
+    if(x)cudaFree(x);if(xq)cudaFree(xq);if(xs)cudaFree(xs);if(g)cudaFree(g);if(u)cudaFree(u);
+    if(mid)cudaFree(mid);if(midq)cudaFree(midq);if(mids)cudaFree(mids);if(outF)cudaFree(outF);
+    (void)cudaSetDevice(saved);
+    return (ok && rel<1e-3) ? 1 : 0;
 }
 
 extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(

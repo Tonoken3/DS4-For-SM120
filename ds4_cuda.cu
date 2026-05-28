@@ -7868,38 +7868,6 @@ extern "C" int ds4_gpu_tp_row_matmul_tensor(
     return cuda_ok(cudaGetLastError(), "tp_row matmul");
 }
 
-/* Filter a token's router selection to this rank's owned expert range for TP MoE
- * expert-parallelism, rewriting GLOBAL expert ids to LOCAL ids within the owned
- * subset [e0, e0+ec). routed_moe is then called with the owned sub-tensor as its
- * base (offset+e0*expert_bytes) and n_total_expert=ec, so it reads ONLY the owned
- * (resident) experts indexed by these local ids. An owned expert g -> (g-e0);
- * any non-owned expert -> local 0 with weight 0 (a resident sentinel contributing
- * nothing). Summing every rank's partial (all-reduce) reproduces the full MoE
- * output. Run per-rank, in place on that rank's replicated router selection. */
-__global__ void tp_filter_experts_kernel(int32_t *selected, float *weights,
-                                         uint32_t n_sel, uint32_t e0, uint32_t ec) {
-    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n_sel) return;
-    int32_t gid = selected[i];
-    if (gid >= (int32_t)e0 && gid < (int32_t)(e0 + ec)) {
-        selected[i] = gid - (int32_t)e0;          /* owned -> local id */
-    } else {
-        selected[i] = 0;                          /* non-owned -> resident sentinel */
-        weights[i] = 0.0f;                        /* contributes nothing */
-    }
-}
-
-extern "C" int ds4_gpu_tp_filter_experts_tensor(
-        ds4_gpu_tensor *selected, ds4_gpu_tensor *weights,
-        uint32_t n_sel, uint32_t e0, uint32_t ec) {
-    if (!selected || !weights || n_sel == 0 || ec == 0) return 0;
-    if (selected->bytes < (uint64_t)n_sel * sizeof(int32_t) ||
-        weights->bytes < (uint64_t)n_sel * sizeof(float)) return 0;
-    tp_filter_experts_kernel<<<(n_sel + 31u) / 32u, 32, 0, ds4_decode_stream()>>>(
-            (int32_t *)selected->ptr, (float *)weights->ptr, n_sel, e0, ec);
-    return cuda_ok(cudaGetLastError(), "tp_filter_experts");
-}
-
 /* ---- Tensor-Parallel validation/benchmark jig (Q8_0 matmul) ----
  * Reusable, TP-degree-parameterized harness: for a real Q8_0 weight + input,
  * compute the full single-GPU result (golden), then both column-parallel and
@@ -11617,7 +11585,13 @@ __global__ static void moe_gate_up_mid_decode_q4K_qwarp32_kernel(
     }
 }
 
-__global__ static void moe_down_sum6_qwarp32_kernel(
+/* Decode (n_tokens==1) direct down-projection + sum over the token's n_expert
+ * selected experts (n_expert in 1..6), writing the summed result straight to out
+ * (no per-expert scratch, no separate sum pass). n_expert==6 is the dense decode
+ * case; n_expert<6 is the TP expert-compacted case (each rank owns a subset).
+ * Generalized from the validated 6-expert kernel by making the loop bound the
+ * runtime n_expert (the grid is per-row, independent of n_expert). */
+__global__ static void moe_down_sumN_qwarp32_kernel(
         float *out,
         const char *down_base,
         const cuda_block_q8_K *midq,
@@ -11625,13 +11599,13 @@ __global__ static void moe_down_sum6_qwarp32_kernel(
         uint64_t down_expert_bytes,
         uint64_t down_row_bytes,
         uint32_t midq_blocks,
-        uint32_t out_dim) {
+        uint32_t out_dim,
+        uint32_t n_expert) {
     uint32_t lane = threadIdx.x & 7u;
     uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
     if (row >= out_dim) return;
     float total = 0.0f;
-    #pragma unroll
-    for (uint32_t slot = 0; slot < 6u; slot++) {
+    for (uint32_t slot = 0; slot < n_expert; slot++) {
         int32_t expert_i = selected[slot];
         if (expert_i < 0) expert_i = 0;
         const cuda_block_q2_K *wr = (const cuda_block_q2_K *)(down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes);
@@ -11644,7 +11618,7 @@ __global__ static void moe_down_sum6_qwarp32_kernel(
     if (lane == 0) out[row] = total;
 }
 
-__global__ static void moe_down_q4K_sum6_qwarp32_kernel(
+__global__ static void moe_down_q4K_sumN_qwarp32_kernel(
         float *out,
         const char *down_base,
         const cuda_block_q8_K *midq,
@@ -11652,13 +11626,13 @@ __global__ static void moe_down_q4K_sum6_qwarp32_kernel(
         uint64_t down_expert_bytes,
         uint64_t down_row_bytes,
         uint32_t midq_blocks,
-        uint32_t out_dim) {
+        uint32_t out_dim,
+        uint32_t n_expert) {
     uint32_t lane = threadIdx.x & 7u;
     uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
     if (row >= out_dim) return;
     float total = 0.0f;
-    #pragma unroll
-    for (uint32_t slot = 0; slot < 6u; slot++) {
+    for (uint32_t slot = 0; slot < n_expert; slot++) {
         int32_t expert_i = selected[slot];
         if (expert_i < 0) expert_i = 0;
         const cuda_block_q4_K *wr = (const cuda_block_q4_K *)(down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes);
@@ -11671,9 +11645,9 @@ __global__ static void moe_down_q4K_sum6_qwarp32_kernel(
     if (lane == 0) out[row] = total;
 }
 
-/* IQ2_XXS down-projection variant of the n_tokens==1 / 6-expert decode kernel.
- * Mirrors moe_down_sum6_qwarp32_kernel but reads IQ2_XXS down weights. */
-__global__ static void moe_down_sum6_iq2xxs_qwarp32_kernel(
+/* IQ2_XXS down-projection variant of the n_tokens==1 / N-expert decode kernel.
+ * Mirrors moe_down_sumN_qwarp32_kernel but reads IQ2_XXS down weights. */
+__global__ static void moe_down_sumN_iq2xxs_qwarp32_kernel(
         float *out,
         const char *down_base,
         const cuda_block_q8_K *midq,
@@ -11681,13 +11655,13 @@ __global__ static void moe_down_sum6_iq2xxs_qwarp32_kernel(
         uint64_t down_expert_bytes,
         uint64_t down_row_bytes,
         uint32_t midq_blocks,
-        uint32_t out_dim) {
+        uint32_t out_dim,
+        uint32_t n_expert) {
     uint32_t lane = threadIdx.x & 7u;
     uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
     if (row >= out_dim) return;
     float total = 0.0f;
-    #pragma unroll
-    for (uint32_t slot = 0; slot < 6u; slot++) {
+    for (uint32_t slot = 0; slot < n_expert; slot++) {
         int32_t expert_i = selected[slot];
         if (expert_i < 0) expert_i = 0;
         const cuda_block_iq2_xxs *wr = (const cuda_block_iq2_xxs *)(down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes);
@@ -12682,8 +12656,12 @@ static int routed_moe_launch(
               getenv("DS4_CUDA_MOE_NO_DOWN_ROW256") == NULL &&
               getenv("DS4_CUDA_MOE_NO_DOWN_ROW128") == NULL &&
               getenv("DS4_CUDA_MOE_NO_DOWN_ROW64") == NULL));
-        const uint32_t use_direct_down_sum6 =
-            n_tokens == 1u && n_expert == 6u &&
+        /* Decode direct down+sum: n_tokens==1 with 1..6 selected experts. Covers
+         * dense decode (n_expert==6) and TP expert-compacted decode (n_expert<6).
+         * This is the validated path; the generic moe_down + moe_sum fallback is
+         * only used for multi-token / >6-expert cases. */
+        const uint32_t use_direct_down_sumN =
+            n_tokens == 1u && n_expert >= 1u && n_expert <= 6u &&
             getenv("DS4_CUDA_MOE_NO_DIRECT_DOWN_SUM6") == NULL;
         uint32_t *sorted_pairs = NULL;
         uint32_t *sorted_offsets = NULL;
@@ -12939,10 +12917,10 @@ static int routed_moe_launch(
                 down_tile_starts = tile16_starts;
                 down_tile_capacity = tile16_capacity;
             }
-            if (use_direct_down_sum6) {
+            if (use_direct_down_sumN) {
                 dim3 sgrid((out_dim + 31u) / 32u, 1, 1);
                 if (q4k_path) {
-                    moe_down_q4K_sum6_qwarp32_kernel<<<sgrid, 256, 0, ds4_decode_stream()>>>(
+                    moe_down_q4K_sumN_qwarp32_kernel<<<sgrid, 256, 0, ds4_decode_stream()>>>(
                         (float *)out->ptr,
                         down_w,
                         midq,
@@ -12950,9 +12928,10 @@ static int routed_moe_launch(
                         down_expert_bytes,
                         down_row_bytes,
                         midq_blocks,
-                        out_dim);
+                        out_dim,
+                        n_expert);
                 } else if (down_iq2xxs) {
-                    moe_down_sum6_iq2xxs_qwarp32_kernel<<<sgrid, 256, 0, ds4_decode_stream()>>>(
+                    moe_down_sumN_iq2xxs_qwarp32_kernel<<<sgrid, 256, 0, ds4_decode_stream()>>>(
                         (float *)out->ptr,
                         down_w,
                         midq,
@@ -12960,9 +12939,10 @@ static int routed_moe_launch(
                         down_expert_bytes,
                         down_row_bytes,
                         midq_blocks,
-                        out_dim);
+                        out_dim,
+                        n_expert);
                 } else {
-                    moe_down_sum6_qwarp32_kernel<<<sgrid, 256, 0, ds4_decode_stream()>>>(
+                    moe_down_sumN_qwarp32_kernel<<<sgrid, 256, 0, ds4_decode_stream()>>>(
                         (float *)out->ptr,
                         down_w,
                         midq,
@@ -12970,14 +12950,15 @@ static int routed_moe_launch(
                         down_expert_bytes,
                         down_row_bytes,
                         midq_blocks,
-                        out_dim);
+                        out_dim,
+                        n_expert);
                 }
             } else if (use_atomic_down) {
                 uint64_t n = (uint64_t)n_tokens * out_dim;
                 zero_kernel<<<(n + 255u) / 256u, 256, 0, ds4_decode_stream()>>>((float *)out->ptr, n);
                 ok = cuda_ok(cudaGetLastError(), "routed_moe atomic zero launch");
             }
-            if (use_direct_down_sum6) {
+            if (use_direct_down_sumN) {
                 /* The direct decode kernel writes the final token row. */
             } else if (sorted_pairs && use_expert_tiles && sorted_offsets && sorted_counts &&
                 down_tile_total && down_tile_experts && down_tile_starts) {
@@ -13074,7 +13055,7 @@ static int routed_moe_launch(
             ok = cuda_ok(cudaGetLastError(), "routed_moe down launch");
         }
         if (prof_ev[5]) (void)cudaEventRecord(prof_ev[5], 0);
-        if (ok && !use_atomic_down && !use_direct_down_sum6) {
+        if (ok && !use_atomic_down && !use_direct_down_sumN) {
             uint64_t n = (uint64_t)n_tokens * out_dim;
             moe_sum_kernel<<<(n + 255) / 256, 256, 0, ds4_decode_stream()>>>((float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, n_tokens);
             ok = cuda_ok(cudaGetLastError(), "routed_moe sum launch");

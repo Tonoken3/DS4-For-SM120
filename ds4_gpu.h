@@ -979,12 +979,6 @@ int ds4_gpu_tp_col_matmul_tensor(ds4_gpu_tensor *out, const void *model_map,
 int ds4_gpu_tp_row_matmul_tensor(ds4_gpu_tensor *out, const void *model_map,
                                  uint64_t weight_offset, int add_to, const ds4_gpu_tensor *x);
 
-/* TP MoE: remap a token's selected experts outside [e0,e0+ec) to e0 with weight 0
- * so routed_moe reads only this rank's owned (resident) experts; all-reduce of the
- * per-rank partials reproduces the full MoE output. In place on router selection. */
-int ds4_gpu_tp_filter_experts_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights,
-                                     uint32_t n_sel, uint32_t e0, uint32_t ec);
-
 /* TP resident-shard jig: validates the build-time shard-cache -> accessor ->
  * matmul path (col + row parallel) reproduces the single-GPU golden. */
 int ds4_gpu_tp_shard_jig(

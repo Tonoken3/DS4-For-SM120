@@ -292,6 +292,7 @@ static uint32_t g_ds4_compress_ratios[DS4_MAX_LAYER] = {0};
 #define DS4_N_LORA_O                  (g_ds4_shape.n_lora_o)
 #define DS4_N_EXPERT                  (g_ds4_shape.n_expert)
 #define DS4_N_EXPERT_USED             (g_ds4_shape.n_expert_used)
+#define DS4_N_EXPERT_USED_MAX         16  /* compile-time bound for stack scratch (runtime n_expert_used is 6) */
 #define DS4_N_EXPERT_SHARED           (g_ds4_shape.n_expert_shared)
 #define DS4_N_FF_EXP                  (g_ds4_shape.n_ff_exp)
 #define DS4_N_HASH_LAYER              (g_ds4_shape.n_hash_layer)
@@ -10170,6 +10171,54 @@ static bool metal_graph_matmul_plain_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
+/* MoE expert compaction (host side), run ONCE per layer after the attention+router
+ * part (layer_part==3) of every rank in a TP stage has synced. A1 has every rank
+ * compute the identical attention+router, so all ranks of the stage hold the SAME
+ * global expert selection; read it from rank r0 only. For each rank r owning experts
+ * [e0,e0+ec), stably compact the selection to that rank's owned experts as a
+ * contiguous list of LOCAL ids (gid-e0) + their weights, written back into that
+ * rank's g->router_selected/router_weights, and return the owned count in
+ * out_count[r]. owned_count[0..tp-1] sum to DS4_N_EXPERT_USED. The per-rank routed_moe
+ * (metal_graph_tp_ffn_part2) then reads ONLY its owned_count experts. Stable order
+ * (skip zeros, keep relative order) keeps each rank's partial bit-identical to the
+ * old zero-weight-sentinel path while reading/computing ~half the experts. */
+static bool metal_graph_tp_prep_experts(ds4_pp_gpu *pp, int s, int tp,
+                                        uint32_t *out_count) {
+    const uint32_t n_used   = (uint32_t)DS4_N_EXPERT_USED;
+    const uint32_t n_expert = (uint32_t)DS4_N_EXPERT;
+    const uint32_t ec       = n_expert / (uint32_t)tp;
+    const int r0 = s * tp;
+    int32_t sel[DS4_N_EXPERT_USED_MAX];
+    float   wts[DS4_N_EXPERT_USED_MAX];
+    if (n_used > DS4_N_EXPERT_USED_MAX) return false;
+    /* The driver has already synced every rank's device after part3, so rank r0's
+     * router selection (identical across the stage's ranks under A1) is ready. */
+    ds4_gpu_pp_set_device(r0);
+    if (!ds4_gpu_tensor_read(pp[r0].g.router_selected, 0, sel, (uint64_t)n_used * sizeof(int32_t))) return false;
+    if (!ds4_gpu_tensor_read(pp[r0].g.router_weights, 0, wts, (uint64_t)n_used * sizeof(float)))   return false;
+    for (int r = 0; r < tp; r++) {
+        const uint32_t e0 = (uint32_t)r * ec;
+        int32_t lsel[DS4_N_EXPERT_USED_MAX];
+        float   lwts[DS4_N_EXPERT_USED_MAX];
+        uint32_t c = 0;
+        for (uint32_t i = 0; i < n_used; i++) {
+            const int32_t gid = sel[i];
+            if (gid >= (int32_t)e0 && gid < (int32_t)(e0 + ec)) {
+                lsel[c] = gid - (int32_t)e0;
+                lwts[c] = wts[i];
+                c++;
+            }
+        }
+        out_count[r] = c;
+        if (c > 0) {
+            ds4_gpu_pp_set_device(r0 + r);
+            if (!ds4_gpu_tensor_write(pp[r0 + r].g.router_selected, 0, lsel, (uint64_t)c * sizeof(int32_t))) return false;
+            if (!ds4_gpu_tensor_write(pp[r0 + r].g.router_weights, 0, lwts, (uint64_t)c * sizeof(float)))   return false;
+        }
+    }
+    return true;
+}
+
 /* Tensor-Parallel FFN/MoE partial for one decode layer, run on EACH rank of a TP
  * stage after the attention+router part (metal_graph_encode_decode_layer with
  * layer_part==3 on rank0) has produced g->ffn_norm + the router selection, both
@@ -10181,15 +10230,15 @@ static bool metal_graph_matmul_plain_tensor(
  *                                      after_attn_hc, hc_split)
  * which is exactly what the fused ds4_gpu_shared_down_hc_expand_q8_0_tensor does
  * (shared-down matmul folded in), so TP must stay unfused. rank/owned-expert
- * range are self-derived from the current device. */
+ * range are self-derived from the current device. owned_count = this rank's
+ * compacted expert count from metal_graph_tp_prep_experts. */
 static bool metal_graph_tp_ffn_part2(ds4_gpu_graph *g, const ds4_model *model,
                                      const ds4_layer_weights *layer,
-                                     uint32_t il, uint32_t pos) {
+                                     uint32_t il, uint32_t pos, uint32_t owned_count) {
     (void)il; (void)pos;
     const int tp = ds4_gpu_tp_degree();
     const int rank = ds4_gpu_tp_rank(ds4_gpu_current_device());
     const uint32_t n_expert = (uint32_t)DS4_N_EXPERT;
-    const uint32_t n_used = (uint32_t)DS4_N_EXPERT_USED;
     const uint32_t ec = n_expert / (uint32_t)tp;
     const uint32_t e0 = (uint32_t)rank * ec;
     const uint32_t shared_dim = (uint32_t)layer->ffn_gate_shexp->dim[1];
@@ -10204,25 +10253,30 @@ static bool metal_graph_tp_ffn_part2(ds4_gpu_graph *g, const ds4_model *model,
     const uint64_t down_expert_bytes = routed_out_dim * down_row_bytes;
     bool ok = true;
 
-    /* MoE expert-parallel: rewrite the selection to this rank's OWNED experts as
-     * LOCAL ids (non-owned -> local 0, weight 0), then call routed_moe with the
-     * owned sub-tensor as base (offset + e0*expert_bytes) and n_total_expert=ec.
-     * routed_moe (UNCHANGED) resolves its base via cuda_model_range_ptr at that
-     * sub-offset (the resident owned sub-range) and indexes by the local ids, so
-     * it reads ONLY owned (resident) experts -> this rank's partial routed_out. */
+    /* MoE expert-parallel (COMPACTED): metal_graph_tp_prep_experts has already
+     * rewritten g->router_selected/router_weights to hold ONLY this rank's
+     * owned experts as a contiguous [owned_count] list of LOCAL ids (gid-e0) +
+     * their weights. Call routed_moe with n_expert=owned_count and the owned
+     * sub-tensor as base (offset + e0*expert_bytes), n_total_expert=ec, so the
+     * kernel reads/computes ONLY the owned (resident) experts -> ~half the MoE
+     * bandwidth+compute. owned_count==0 (all selected experts on the other
+     * rank) -> just zero this rank's partial; the all-reduce reproduces the
+     * full MoE output. */
     const uint64_t gate_owned_off = layer->ffn_gate_exps->abs_offset + (uint64_t)e0 * gate_expert_bytes;
     const uint64_t up_owned_off   = layer->ffn_up_exps->abs_offset   + (uint64_t)e0 * gate_expert_bytes;
     const uint64_t down_owned_off = layer->ffn_down_exps->abs_offset + (uint64_t)e0 * down_expert_bytes;
-    if (ok) ok = ds4_gpu_tp_filter_experts_tensor(g->router_selected, g->router_weights,
-                                                  n_used, e0, ec) != 0;
-    if (ok) ok = ds4_gpu_routed_moe_one_tensor(g->routed_out, g->routed_gate, g->routed_up,
+    if (ok && owned_count > 0) {
+        ok = ds4_gpu_routed_moe_one_tensor(g->routed_out, g->routed_gate, g->routed_up,
                     g->routed_mid, g->routed_down, model->map, model->size,
                     gate_owned_off, up_owned_off, down_owned_off, layer->ffn_gate_exps->type,
                     layer->ffn_down_exps->type, gate_expert_bytes, gate_row_bytes,
                     down_expert_bytes, down_row_bytes, (uint32_t)expert_in_dim,
                     (uint32_t)down_in_dim, (uint32_t)routed_out_dim,
-                    g->router_selected, g->router_weights, ec, n_used,
+                    g->router_selected, g->router_weights, ec, owned_count,
                     DS4_SWIGLU_CLAMP_EXP, g->ffn_norm) != 0;
+    } else if (ok) {
+        ok = ds4_gpu_tensor_fill_f32(g->routed_out, 0.0f, (uint64_t)routed_out_dim) != 0;
+    }
 
     /* shared-expert FFN, TP: column-parallel gate/up -> swiglu(shard_dim) ->
      * row-parallel down -> this rank's partial shared_out. */
@@ -12026,12 +12080,10 @@ static bool metal_graph_encode_token_raw_swa_tp(
         const int r0 = s * tp;
         const int l0 = pp[r0].layer_start, l1 = pp[r0].layer_end;
         for (int il = l0; ok && il <= l1; il++) {
-            /* (1) attention+router AND (2) FFN/MoE partial on EVERY rank. A1: each
-             * rank runs the full attention from the identical cur_hc, so they all
-             * produce bit-identical ffn_norm/after_attn_hc/hc_split/router — no
-             * broadcast. part3 then part2 are on the same per-rank stream (ordered),
-             * so no sync between them. The router selection is filtered to this
-             * rank's owned experts inside part2. */
+            /* (1) attention+router (part3) on EVERY rank. A1: each rank runs the full
+             * attention from the identical cur_hc, so they all produce bit-identical
+             * ffn_norm/after_attn_hc/hc_split/router — no broadcast. Issue all ranks
+             * before syncing so the attentions overlap across GPUs. */
             tpf_t = tp_prof ? now_sec() : 0.0;
             for (int r = 0; ok && r < tp; r++) {
                 const int rr = s * tp + r;
@@ -12039,7 +12091,19 @@ static bool metal_graph_encode_token_raw_swa_tp(
                 ds4_gpu_pp_set_device(rr);
                 ok = metal_graph_encode_decode_layer(ggr, model, &weights->layer[il], (uint32_t)il,
                          pos, ggr->layer_raw_cache[il], ggr->raw_cap, raw_row, n_raw, token, false, 3);
-                if (ok) ok = metal_graph_tp_ffn_part2(ggr, model, &weights->layer[il], (uint32_t)il, pos);
+            }
+            for (int r = 0; ok && r < tp; r++) { ds4_gpu_pp_set_device(s * tp + r); ok = ok && ds4_gpu_synchronize() != 0; }
+            /* (1.5) compact the (identical) router selection to each rank's owned
+             * experts on the host; needs the router done (synced above). */
+            uint32_t moe_count[8] = {0};
+            if (ok) ok = metal_graph_tp_prep_experts(pp, s, tp, moe_count);
+            /* (2) FFN/MoE partial on EVERY rank, each reading only its owned_count
+             * experts. Issue all ranks before syncing so MoE+shared-FFN overlap. */
+            for (int r = 0; ok && r < tp; r++) {
+                const int rr = s * tp + r;
+                ds4_gpu_graph *ggr = &pp[rr].g;
+                ds4_gpu_pp_set_device(rr);
+                ok = metal_graph_tp_ffn_part2(ggr, model, &weights->layer[il], (uint32_t)il, pos, moe_count[r]);
             }
             for (int r = 0; ok && r < tp; r++) { ds4_gpu_pp_set_device(s * tp + r); ok = ok && ds4_gpu_synchronize() != 0; }
             if (tp_prof) tpf_cmp += now_sec() - tpf_t;

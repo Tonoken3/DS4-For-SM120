@@ -16895,6 +16895,10 @@ static void ds4_tp_matmul_selftest(const ds4_model *model, const ds4_weights *we
     if (x) ds4_gpu_tensor_free(x);
     if (out_full) ds4_gpu_tensor_free(out_full);
     if (out_tp) ds4_gpu_tensor_free(out_tp);
+
+    /* Cross-GPU column-parallel TP matmul on the same real weight (2 GPUs). */
+    (void)ds4_gpu_tp_xgpu_colparallel_selftest(model->map, model->size,
+                                               w->abs_offset, in_dim, out_dim);
 }
 
 /* Metal generation entry point.  The model runs as one local whole-graph

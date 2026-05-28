@@ -7607,6 +7607,92 @@ extern "C" int ds4_gpu_matmul_q8_0_brange_tensor(
     return cuda_ok(cudaGetLastError(), "matmul_q8_0_brange launch");
 }
 
+/* Cross-GPU Tensor-Parallel validation brick: column-parallel Q8_0 matmul split
+ * across 2 real GPUs vs the full single-GPU matmul. dev0 computes output rows
+ * [0,mid), dev1 computes [mid,out_dim) from a copied weight shard, results are
+ * gathered and compared. Proves the atomic TP matmul op on real weights/GPUs.
+ * Env-gated (called from the host self-test). Returns 1 if results match. */
+extern "C" int ds4_gpu_tp_xgpu_colparallel_selftest(
+        const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim) {
+    int ndev = 0; (void)cudaGetDeviceCount(&ndev);
+    if (ndev < 2) { fprintf(stderr, "ds4: TP xgpu colparallel test needs >=2 GPUs\n"); return 0; }
+    const int dA = 0, dB = 1;
+    const uint64_t blocks = (in_dim + 31) / 32;
+    const uint64_t wbytes = out_dim * blocks * 34;
+    if (weight_offset > model_size || wbytes > model_size - weight_offset) return 0;
+    const int dp4a = cuda_q8_use_dp4a();
+    int saved = 0; (void)cudaGetDevice(&saved);
+    int ok = 1;
+
+    /* dev0: input + prequant + full-resident weight + full matmul */
+    if (cudaSetDevice(dA) != cudaSuccess) return 0;
+    const char *wfull = cuda_model_range_ptr(model_map, weight_offset, wbytes, "tp_xgpu_test");
+    if (!wfull) { fprintf(stderr, "ds4: TP xgpu test: weight not resident on dev0\n"); return 0; }
+    float *x = NULL, *outF = NULL, *outCol = NULL, *outc0 = NULL;
+    int8_t *xqA = NULL; float *xsA = NULL;
+    std::vector<float> hx(in_dim);
+    for (uint64_t i = 0; i < in_dim; i++) hx[i] = sinf((float)i * 0.011f) * 0.5f;
+    ok = ok && cudaMalloc(&x, in_dim * sizeof(float)) == cudaSuccess;
+    ok = ok && cudaMalloc(&xqA, blocks * 32) == cudaSuccess;
+    ok = ok && cudaMalloc(&xsA, blocks * sizeof(float)) == cudaSuccess;
+    ok = ok && cudaMalloc(&outF, out_dim * sizeof(float)) == cudaSuccess;
+    ok = ok && cudaMalloc(&outCol, out_dim * sizeof(float)) == cudaSuccess;
+    if (ok) ok = cudaMemcpy(x, hx.data(), in_dim * sizeof(float), cudaMemcpyHostToDevice) == cudaSuccess;
+    if (ok) { quantize_q8_0_f32_kernel<<<(unsigned)blocks, 32>>>(xqA, xsA, x, in_dim, blocks); ok = cudaGetLastError() == cudaSuccess; }
+    if (ok) { matmul_q8_0_preq_warp8_kernel<<<((unsigned)out_dim + 7u) / 8u, 256>>>(
+                  outF, (const unsigned char *)wfull, xqA, xsA, in_dim, out_dim, blocks, dp4a); ok = cudaGetLastError() == cudaSuccess; }
+    const uint64_t mid = out_dim / 2;
+    const uint64_t r1 = out_dim - mid;
+    if (ok) ok = cudaMalloc(&outc0, (mid ? mid : 1) * sizeof(float)) == cudaSuccess;
+    if (ok && mid) { matmul_q8_0_preq_warp8_kernel<<<((unsigned)mid + 7u) / 8u, 256>>>(
+                  outc0, (const unsigned char *)wfull, xqA, xsA, in_dim, mid, blocks, dp4a); ok = cudaGetLastError() == cudaSuccess; }
+    if (ok) ok = cudaDeviceSynchronize() == cudaSuccess;
+
+    /* dev1: copy weight shard rows [mid,out) + prequant, compute rows [mid,out) */
+    char *w1 = NULL; int8_t *xqB = NULL; float *xsB = NULL; float *outc1 = NULL;
+    if (ok) ok = cudaSetDevice(dB) == cudaSuccess;
+    if (ok) ok = cudaMalloc(&w1, r1 * blocks * 34) == cudaSuccess;
+    if (ok) ok = cudaMalloc(&xqB, blocks * 32) == cudaSuccess;
+    if (ok) ok = cudaMalloc(&xsB, blocks * sizeof(float)) == cudaSuccess;
+    if (ok) ok = cudaMalloc(&outc1, (r1 ? r1 : 1) * sizeof(float)) == cudaSuccess;
+    if (ok) ok = cudaMemcpyPeer(w1, dB, wfull + mid * blocks * 34, dA, r1 * blocks * 34) == cudaSuccess;
+    if (ok) ok = cudaMemcpyPeer(xqB, dB, xqA, dA, blocks * 32) == cudaSuccess;
+    if (ok) ok = cudaMemcpyPeer(xsB, dB, xsA, dA, blocks * sizeof(float)) == cudaSuccess;
+    if (ok) { matmul_q8_0_preq_warp8_kernel<<<((unsigned)r1 + 7u) / 8u, 256>>>(
+                  outc1, (const unsigned char *)w1, xqB, xsB, in_dim, r1, blocks, dp4a); ok = cudaGetLastError() == cudaSuccess; }
+    if (ok) ok = cudaDeviceSynchronize() == cudaSuccess;
+
+    /* gather onto dev0: [0,mid) from outc0, [mid,out) from dev1 outc1 */
+    if (ok) ok = cudaSetDevice(dA) == cudaSuccess;
+    if (ok && mid) ok = cudaMemcpy(outCol, outc0, mid * sizeof(float), cudaMemcpyDeviceToDevice) == cudaSuccess;
+    if (ok) ok = cudaMemcpyPeer(outCol + mid, dA, outc1, dB, r1 * sizeof(float)) == cudaSuccess;
+    if (ok) ok = cudaDeviceSynchronize() == cudaSuccess;
+
+    double maxabs = 0.0, scale = 0.0;
+    if (ok) {
+        std::vector<float> hF(out_dim), hC(out_dim);
+        ok = cudaMemcpy(hF.data(), outF, out_dim * sizeof(float), cudaMemcpyDeviceToHost) == cudaSuccess
+          && cudaMemcpy(hC.data(), outCol, out_dim * sizeof(float), cudaMemcpyDeviceToHost) == cudaSuccess;
+        if (ok) for (uint64_t i = 0; i < out_dim; i++) {
+            double a = fabs((double)hF[i]); if (a > scale) scale = a;
+            double d = fabs((double)hF[i] - (double)hC[i]); if (d > maxabs) maxabs = d;
+        }
+        if (scale < 1e-12) scale = 1e-12;
+        fprintf(stderr, "ds4: TP cross-GPU column-parallel self-test: %s in=%llu out=%llu mid=%llu (dev0 rows[0,%llu) dev1 rows[%llu,%llu)) maxabs=%.3e rel=%.3e\n",
+                (ok && maxabs / scale < 1e-3) ? "PASS" : "FAIL",
+                (unsigned long long)in_dim, (unsigned long long)out_dim, (unsigned long long)mid,
+                (unsigned long long)mid, (unsigned long long)mid, (unsigned long long)out_dim,
+                maxabs, maxabs / scale);
+    } else {
+        fprintf(stderr, "ds4: TP cross-GPU column-parallel self-test: setup failed\n");
+    }
+    cudaSetDevice(dA); cudaFree(x); cudaFree(xqA); cudaFree(xsA); cudaFree(outF); cudaFree(outCol); cudaFree(outc0);
+    cudaSetDevice(dB); cudaFree(w1); cudaFree(xqB); cudaFree(xsB); cudaFree(outc1);
+    (void)cudaSetDevice(saved);
+    return (ok && maxabs / scale < 1e-3) ? 1 : 0;
+}
+
 extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
         ds4_gpu_tensor *out0,
         ds4_gpu_tensor *out1,

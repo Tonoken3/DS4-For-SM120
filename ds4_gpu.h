@@ -928,6 +928,12 @@ int ds4_gpu_matmul_q8_0_brange_tensor(
         uint64_t block_start, uint64_t block_end, int add_to,
         const ds4_gpu_tensor *x);
 
+/* Cross-GPU TP validation: column-parallel Q8_0 matmul split across 2 GPUs vs
+ * the full single-GPU result. Returns 1 if they match. */
+int ds4_gpu_tp_xgpu_colparallel_selftest(
+        const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim);
+
 int ds4_gpu_pp_event_record(int gpu);
 int ds4_gpu_pp_stream_wait_event(int gpu, int event_gpu);
 void *ds4_gpu_pp_stream_get(int gpu);

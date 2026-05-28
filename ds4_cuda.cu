@@ -2243,6 +2243,7 @@ extern "C" int ds4_gpu_tp_rank(int g) { return g_tp_degree > 1 ? (g % g_tp_degre
 extern "C" int ds4_gpu_tp_stage(int g) { return g_tp_degree > 1 ? (g / g_tp_degree) : g; }
 extern "C" int ds4_gpu_tp_nstage(void) { return g_tp_degree > 1 ? (g_pp_ngpu / g_tp_degree) : g_pp_ngpu; }
 extern "C" int ds4_gpu_tp_stage_dev0(int s) { return g_tp_degree > 1 ? (s * g_tp_degree) : s; }
+extern "C" int ds4_gpu_current_device(void) { int d = 0; (void)cudaGetDevice(&d); return d; }
 extern "C" void *ds4_gpu_pp_active_ptr(int g) { return (g >= 0 && g < g_pp_ngpu) ? g_pp_active[g] : NULL; }
 extern "C" int ds4_gpu_pp_p2p_copy(int dst_gpu, int src_gpu) {
     if (dst_gpu < 0 || dst_gpu >= g_pp_ngpu || src_gpu < 0 || src_gpu >= g_pp_ngpu) return 0;
@@ -7868,19 +7869,23 @@ extern "C" int ds4_gpu_tp_row_matmul_tensor(
 }
 
 /* Filter a token's router selection to this rank's owned expert range for TP MoE
- * expert-parallelism: any selected expert outside [e0, e0+ec) is remapped to e0
- * (a resident owned expert) with weight 0, so the UNCHANGED routed_moe reads only
- * resident (owned) experts and the zero-weight sentinels contribute nothing.
- * Summing every rank's partial (all-reduce) reproduces the full MoE output.
- * Run per-rank, in place on that rank's replicated router selection. */
+ * expert-parallelism, rewriting GLOBAL expert ids to LOCAL ids within the owned
+ * subset [e0, e0+ec). routed_moe is then called with the owned sub-tensor as its
+ * base (offset+e0*expert_bytes) and n_total_expert=ec, so it reads ONLY the owned
+ * (resident) experts indexed by these local ids. An owned expert g -> (g-e0);
+ * any non-owned expert -> local 0 with weight 0 (a resident sentinel contributing
+ * nothing). Summing every rank's partial (all-reduce) reproduces the full MoE
+ * output. Run per-rank, in place on that rank's replicated router selection. */
 __global__ void tp_filter_experts_kernel(int32_t *selected, float *weights,
                                          uint32_t n_sel, uint32_t e0, uint32_t ec) {
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n_sel) return;
     int32_t gid = selected[i];
-    if (gid < (int32_t)e0 || gid >= (int32_t)(e0 + ec)) {
-        selected[i] = (int32_t)e0;
-        weights[i] = 0.0f;
+    if (gid >= (int32_t)e0 && gid < (int32_t)(e0 + ec)) {
+        selected[i] = gid - (int32_t)e0;          /* owned -> local id */
+    } else {
+        selected[i] = 0;                          /* non-owned -> resident sentinel */
+        weights[i] = 0.0f;                        /* contributes nothing */
     }
 }
 

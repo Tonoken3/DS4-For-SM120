@@ -10170,6 +10170,75 @@ static bool metal_graph_matmul_plain_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
+/* Tensor-Parallel FFN/MoE partial for one decode layer, run on EACH rank of a TP
+ * stage after the attention+router part (metal_graph_encode_decode_layer with
+ * layer_part==3 on rank0) has produced g->ffn_norm + the router selection, both
+ * broadcast to this rank. Produces g->ffn_out = this rank's partial: its owned
+ * MoE experts + its shard of the shared-expert FFN, left in g->routed_out and
+ * g->shared_out (NOT summed). The DRIVER then all-reduces BOTH across the stage's
+ * ranks and runs the unfused combine
+ *   ds4_gpu_hc_expand_add_split_tensor(after_ffn_hc, routed_out, shared_out,
+ *                                      after_attn_hc, hc_split)
+ * which is exactly what the fused ds4_gpu_shared_down_hc_expand_q8_0_tensor does
+ * (shared-down matmul folded in), so TP must stay unfused. rank/owned-expert
+ * range are self-derived from the current device. */
+static bool metal_graph_tp_ffn_part2(ds4_gpu_graph *g, const ds4_model *model,
+                                     const ds4_layer_weights *layer,
+                                     uint32_t il, uint32_t pos) {
+    (void)il; (void)pos;
+    const int tp = ds4_gpu_tp_degree();
+    const int rank = ds4_gpu_tp_rank(ds4_gpu_current_device());
+    const uint32_t n_expert = (uint32_t)DS4_N_EXPERT;
+    const uint32_t n_used = (uint32_t)DS4_N_EXPERT_USED;
+    const uint32_t ec = n_expert / (uint32_t)tp;
+    const uint32_t e0 = (uint32_t)rank * ec;
+    const uint32_t shared_dim = (uint32_t)layer->ffn_gate_shexp->dim[1];
+    const uint32_t shard_dim  = shared_dim / (uint32_t)tp;
+    const uint64_t expert_in_dim  = layer->ffn_gate_exps->dim[0];
+    const uint64_t expert_mid_dim = layer->ffn_gate_exps->dim[1];
+    const uint64_t down_in_dim    = layer->ffn_down_exps->dim[0];
+    const uint64_t routed_out_dim = layer->ffn_down_exps->dim[1];
+    const uint64_t gate_row_bytes   = routed_expert_row_bytes(layer->ffn_gate_exps);
+    const uint64_t gate_expert_bytes = expert_mid_dim * gate_row_bytes;
+    const uint64_t down_row_bytes    = routed_expert_row_bytes(layer->ffn_down_exps);
+    const uint64_t down_expert_bytes = routed_out_dim * down_row_bytes;
+    bool ok = true;
+
+    /* MoE expert-parallel: rewrite the selection to this rank's OWNED experts as
+     * LOCAL ids (non-owned -> local 0, weight 0), then call routed_moe with the
+     * owned sub-tensor as base (offset + e0*expert_bytes) and n_total_expert=ec.
+     * routed_moe (UNCHANGED) resolves its base via cuda_model_range_ptr at that
+     * sub-offset (the resident owned sub-range) and indexes by the local ids, so
+     * it reads ONLY owned (resident) experts -> this rank's partial routed_out. */
+    const uint64_t gate_owned_off = layer->ffn_gate_exps->abs_offset + (uint64_t)e0 * gate_expert_bytes;
+    const uint64_t up_owned_off   = layer->ffn_up_exps->abs_offset   + (uint64_t)e0 * gate_expert_bytes;
+    const uint64_t down_owned_off = layer->ffn_down_exps->abs_offset + (uint64_t)e0 * down_expert_bytes;
+    if (ok) ok = ds4_gpu_tp_filter_experts_tensor(g->router_selected, g->router_weights,
+                                                  n_used, e0, ec) != 0;
+    if (ok) ok = ds4_gpu_routed_moe_one_tensor(g->routed_out, g->routed_gate, g->routed_up,
+                    g->routed_mid, g->routed_down, model->map, model->size,
+                    gate_owned_off, up_owned_off, down_owned_off, layer->ffn_gate_exps->type,
+                    layer->ffn_down_exps->type, gate_expert_bytes, gate_row_bytes,
+                    down_expert_bytes, down_row_bytes, (uint32_t)expert_in_dim,
+                    (uint32_t)down_in_dim, (uint32_t)routed_out_dim,
+                    g->router_selected, g->router_weights, ec, n_used,
+                    DS4_SWIGLU_CLAMP_EXP, g->ffn_norm) != 0;
+
+    /* shared-expert FFN, TP: column-parallel gate/up -> swiglu(shard_dim) ->
+     * row-parallel down -> this rank's partial shared_out. */
+    if (ok) ok = ds4_gpu_tp_col_matmul_tensor(g->shared_gate, model->map,
+                    layer->ffn_gate_shexp->abs_offset, g->ffn_norm) != 0;
+    if (ok) ok = ds4_gpu_tp_col_matmul_tensor(g->shared_up, model->map,
+                    layer->ffn_up_shexp->abs_offset, g->ffn_norm) != 0;
+    if (ok) ok = ds4_gpu_swiglu_tensor(g->shared_mid, g->shared_gate, g->shared_up,
+                    shard_dim, DS4_SWIGLU_CLAMP_EXP, 1.0f) != 0;
+    if (ok) ok = ds4_gpu_tp_row_matmul_tensor(g->shared_out, model->map,
+                    layer->ffn_down_shexp->abs_offset, 0, g->shared_mid) != 0;
+    /* g->routed_out and g->shared_out now hold this rank's partials; the driver
+     * all-reduces both and runs the hc_expand_add_split combine. */
+    return ok;
+}
+
 static bool metal_graph_encode_decode_layer(
         ds4_gpu_graph  *g,
         const ds4_model        *model,
@@ -10852,6 +10921,7 @@ static bool metal_graph_encode_decode_layer(
         metal_graph_debug_dump_tensor("ffn_moe_weights_scaled", g->router_weights, DS4_N_EXPERT_USED, il, pos);
     }
     } /* !skip_router */
+    if (layer_part == 3) return ok;  /* TP: attention+router done; FFN/MoE runs via metal_graph_tp_ffn_part2 */
 decode_layer_post_router:
     if (ok) ok = ds4_gpu_routed_moe_one_tensor(g->routed_out,
                                                  g->routed_gate,
@@ -11911,6 +11981,115 @@ typedef struct {
     double output_ms;
 } ds4_pp_profile;
 
+/* Tensor-Parallel single-token decode driver (TP_k x PP_nstage). Within each
+ * pipeline stage the k ranks cooperate per layer; attention runs on the stage's
+ * rank0 (A2) and is broadcast, then every rank computes its FFN/MoE shard and the
+ * partials are all-reduced. Correctness-first: ranks run sequentially within a
+ * layer (still exact via all-reduce) — concurrency for the TPS win comes later.
+ * Validated against the pure-PP path by output-token equality (temp 0). */
+static bool metal_graph_encode_token_raw_swa_tp(
+        ds4_pp_gpu *pp, int ngpu,
+        const ds4_model *model,
+        const ds4_weights *weights,
+        int token,
+        uint32_t pos,
+        bool need_logits,
+        ds4_pp_profile *pp_profile) {
+    (void)pp_profile;
+    const int tp = ds4_gpu_tp_degree();
+    const int nstage = ngpu / tp;
+    ds4_gpu_graph *g0 = &pp[0].g;
+    if (g0->raw_cap == 0) {
+        fprintf(stderr, "ds4: TP raw KV cache is not allocated\n");
+        return false;
+    }
+    const uint32_t raw_row = pos % g0->raw_cap;
+    const uint32_t n_raw = metal_graph_raw_span_for_batch(g0, pos, 1);
+
+    /* embed token -> stage0 rank0 (device 0) cur_hc */
+    ds4_gpu_pp_set_device(0);
+    bool ok = ds4_gpu_embed_token_hc_tensor(g0->cur_hc, model->map, model->size,
+                  weights->token_embd->abs_offset, (uint32_t)weights->token_embd->dim[1],
+                  (uint32_t)token, DS4_N_EMBD, DS4_N_HC) != 0;
+    if (ok) ok = ds4_gpu_synchronize() != 0;
+
+    for (int s = 0; ok && s < nstage; s++) {
+        const int r0 = s * tp;                 /* attention/router rank of the stage */
+        const int l0 = pp[r0].layer_start, l1 = pp[r0].layer_end;
+        for (int il = l0; ok && il <= l1; il++) {
+            ds4_gpu_graph *gg0 = &pp[r0].g;
+            /* (1) attention + router on rank0 (layer_part==3 stops after the router) */
+            ds4_gpu_pp_set_device(r0);
+            ok = metal_graph_encode_decode_layer(gg0, model, &weights->layer[il], (uint32_t)il,
+                     pos, gg0->layer_raw_cache[il], gg0->raw_cap, raw_row, n_raw, token, false, 3);
+            if (ok) ok = ds4_gpu_synchronize() != 0;
+            /* (2) broadcast the FFN-part inputs rank0 -> each other rank of the stage */
+            for (int r = 1; ok && r < tp; r++) {
+                const int rr = s * tp + r;
+                ds4_gpu_graph *ggr = &pp[rr].g;
+#define TP_BCAST(field) do { if (ok) ok = ds4_gpu_pp_p2p_copy_ptr(rr, r0, \
+        ds4_gpu_tensor_device_ptr(ggr->field), ds4_gpu_tensor_device_ptr(gg0->field), \
+        ds4_gpu_tensor_bytes(gg0->field)) != 0; } while (0)
+                TP_BCAST(ffn_norm);
+                TP_BCAST(after_attn_hc);
+                TP_BCAST(hc_split);
+                TP_BCAST(router_selected);
+                TP_BCAST(router_weights);
+#undef TP_BCAST
+            }
+            /* (3) FFN/MoE partial on every rank (each reads only its owned shards) */
+            for (int r = 0; ok && r < tp; r++) {
+                ds4_gpu_pp_set_device(s * tp + r);
+                ok = metal_graph_tp_ffn_part2(&pp[s * tp + r].g, model, &weights->layer[il],
+                                              (uint32_t)il, pos);
+            }
+            for (int r = 0; ok && r < tp; r++) { ds4_gpu_pp_set_device(s * tp + r); ok = ok && ds4_gpu_synchronize() != 0; }
+            /* (4) all-reduce routed_out and shared_out across the stage's ranks */
+            {
+                int devs[8];
+                float *rbuf[8], *sbuf[8];
+                for (int r = 0; r < tp; r++) {
+                    devs[r] = s * tp + r;
+                    rbuf[r] = (float *)ds4_gpu_tensor_device_ptr(pp[s * tp + r].g.routed_out);
+                    sbuf[r] = (float *)ds4_gpu_tensor_device_ptr(pp[s * tp + r].g.shared_out);
+                }
+                if (ok) ok = ds4_gpu_tp_all_reduce_f32(devs, tp, rbuf, (uint32_t)DS4_N_EMBD) != 0;
+                if (ok) ok = ds4_gpu_tp_all_reduce_f32(devs, tp, sbuf, (uint32_t)DS4_N_EMBD) != 0;
+            }
+            /* (5) combine on every rank (unfused == fused shared_down_hc), then swap */
+            for (int r = 0; ok && r < tp; r++) {
+                const int rr = s * tp + r;
+                ds4_gpu_graph *ggr = &pp[rr].g;
+                ds4_gpu_pp_set_device(rr);
+                ok = ds4_gpu_hc_expand_add_split_tensor(ggr->after_ffn_hc, ggr->routed_out,
+                        ggr->shared_out, ggr->after_attn_hc, ggr->hc_split, DS4_N_EMBD, DS4_N_HC) != 0;
+                ds4_gpu_tensor *tmp = ggr->cur_hc; ggr->cur_hc = ggr->after_ffn_hc; ggr->after_ffn_hc = tmp;
+            }
+            for (int r = 0; ok && r < tp; r++) { ds4_gpu_pp_set_device(s * tp + r); ok = ok && ds4_gpu_synchronize() != 0; }
+        }
+        /* P2P stage output (rank0 cur_hc) -> next stage rank0 */
+        if (ok && s + 1 < nstage) {
+            const int nr0 = (s + 1) * tp;
+            ds4_gpu_synchronize();
+            ok = ds4_gpu_pp_p2p_copy_ptr(nr0, r0,
+                    ds4_gpu_tensor_device_ptr(pp[nr0].g.cur_hc),
+                    ds4_gpu_tensor_device_ptr(pp[r0].g.cur_hc),
+                    ds4_gpu_tensor_bytes(pp[r0].g.cur_hc)) != 0;
+        }
+    }
+
+    /* logits on the output-head device (ngpu-1). Both ranks of the last stage hold
+     * the identical final activation in cur_hc (post all-reduce+combine+swap), so
+     * the output head reads its own cur_hc with no copy. */
+    if (ok && need_logits) {
+        const int last = ngpu - 1;
+        ds4_gpu_pp_set_device(last);
+        ok = metal_graph_encode_output_head(&pp[last].g, model, weights, weights->output->dim[1]);
+    }
+    ds4_gpu_pp_set_device(0);
+    return ok;
+}
+
 static bool metal_graph_encode_token_raw_swa_pp(
         ds4_pp_gpu *pp, int ngpu,
         const ds4_model *model,
@@ -11919,6 +12098,10 @@ static bool metal_graph_encode_token_raw_swa_pp(
         uint32_t pos,
         bool need_logits,
         ds4_pp_profile *pp_profile) {
+    if (ds4_gpu_tp_enabled()) {
+        return metal_graph_encode_token_raw_swa_tp(pp, ngpu, model, weights,
+                                                   token, pos, need_logits, pp_profile);
+    }
     ds4_gpu_graph *g0 = &pp[0].g;
     if (g0->raw_cap == 0) {
         fprintf(stderr, "ds4: PP raw KV cache is not allocated\n");
@@ -17332,6 +17515,13 @@ static int generate_metal_graph_raw_swa(
                                                 (uint32_t)token,
                                                 (uint32_t)pos,
                                                 logits);
+            if (ok && i == 0) {
+                const char *dld = getenv("DS4_DUMP_DECODE_LOGITS");
+                if (dld && dld[0]) {
+                    (void)write_f32_binary_file(dld, logits, DS4_N_VOCAB);
+                    fprintf(stderr, "ds4: wrote first decode-step logits to %s\n", dld);
+                }
+            }
             if (ok) next_token = sample_argmax(logits, DS4_N_VOCAB);
         }
         if (!ok) break;

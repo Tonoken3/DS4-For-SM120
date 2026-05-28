@@ -912,6 +912,7 @@ int ds4_gpu_tp_rank(int g);
 int ds4_gpu_tp_stage(int g);
 int ds4_gpu_tp_nstage(void);
 int ds4_gpu_tp_stage_dev0(int s);
+int ds4_gpu_current_device(void);
 
 void *ds4_gpu_pp_active_ptr(int g);
 int ds4_gpu_pp_p2p_copy(int dst_gpu, int src_gpu);

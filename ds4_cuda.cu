@@ -8115,6 +8115,117 @@ extern "C" int ds4_gpu_tp_ffn_jig(
     return (ok && rel<1e-3) ? 1 : 0;
 }
 
+/* TP grouped O-projection jig: de-risks the attention-TP O-proj split before
+ * integration. The MLA O-proj is grouped-LoRA: output_a maps each of n_groups
+ * groups' group_dim heads -> a rank-vector (attn_low=[n_groups,rank]); output_b
+ * maps [n_groups*rank -> n_embd]. The TP split gives each rank a CONTIGUOUS set of
+ * gpr=n_groups/k groups: output_a is column-sharded (its owned output rows
+ * [r*gpr*rank,(r+1)*gpr*rank), contiguous) and output_b is row-sharded (its owned
+ * input-block range), so rank r computes its groups' attn_low + a partial n_embd;
+ * the partials all-reduce to the full O-proj output. This is the same col->row->
+ * all-reduce pattern as the FFN-block jig, specialized to the grouped output_a. */
+extern "C" int ds4_gpu_tp_oproj_jig(
+        const void *model_map, uint64_t model_size,
+        uint64_t out_a_off, uint64_t out_b_off,
+        uint64_t group_dim, uint64_t rank, uint32_t n_groups,
+        uint64_t n_embd, int k) {
+    int ndev = 0; (void)cudaGetDeviceCount(&ndev);
+    if (k < 2 || k > ndev || k > 8) { fprintf(stderr, "ds4: TP O-proj jig: need 2..%d GPUs (k=%d)\n", ndev, k); return 0; }
+    if ((n_groups % (uint32_t)k) != 0) {
+        fprintf(stderr, "ds4: TP O-proj jig: n_groups(%u) not divisible by k=%d; skip\n", n_groups, k); return 0;
+    }
+    const uint64_t low_dim = (uint64_t)n_groups * rank;
+    const uint64_t blocks_a = (group_dim + 31) / 32;   /* output_a input blocks (group_dim) */
+    const uint64_t blocks_b = (low_dim + 31) / 32;     /* output_b input blocks (low_dim)    */
+    if ((blocks_b % (uint64_t)k) != 0) {
+        fprintf(stderr, "ds4: TP O-proj jig: low_dim blocks(%llu) not divisible by k=%d; skip\n",
+                (unsigned long long)blocks_b, k); return 0;
+    }
+    const uint64_t out_a_wb = low_dim * blocks_a * 34;
+    const uint64_t out_b_wb = n_embd * blocks_b * 34;
+    const int dp4a = cuda_q8_use_dp4a();
+    int saved = 0; (void)cudaGetDevice(&saved);
+    int ok = 1;
+    if (cudaSetDevice(0) != cudaSuccess) return 0;
+    const char *aW = cuda_model_range_ptr(model_map, out_a_off, out_a_wb, "tp_oproj_a");
+    const char *bW = cuda_model_range_ptr(model_map, out_b_off, out_b_wb, "tp_oproj_b");
+    if (!aW || !bW) { fprintf(stderr, "ds4: TP O-proj jig: weights not resident on dev0\n"); return 0; }
+
+    /* golden full O-proj on dev0: heads -> grouped output_a -> attn_low -> output_b -> out */
+    float *heads=NULL,*low=NULL,*outF=NULL; int8_t *xq=NULL,*lowq=NULL; float *xs=NULL,*lows=NULL;
+    const uint64_t heads_n = (uint64_t)n_groups * group_dim;
+    std::vector<float> hh(heads_n); for (uint64_t i=0;i<heads_n;i++) hh[i]=sinf((float)i*0.007f)*0.5f;
+    ok = ok && cudaMalloc(&heads,heads_n*4)==cudaSuccess
+            && cudaMalloc(&xq,(uint64_t)n_groups*blocks_a*32)==cudaSuccess && cudaMalloc(&xs,(uint64_t)n_groups*blocks_a*4)==cudaSuccess
+            && cudaMalloc(&low,low_dim*4)==cudaSuccess
+            && cudaMalloc(&lowq,blocks_b*32)==cudaSuccess && cudaMalloc(&lows,blocks_b*4)==cudaSuccess
+            && cudaMalloc(&outF,n_embd*4)==cudaSuccess;
+    if (ok) ok = cudaMemcpy(heads,hh.data(),heads_n*4,cudaMemcpyHostToDevice)==cudaSuccess;
+    if (ok) { dim3 qg((unsigned)blocks_a,(unsigned)n_groups,1);
+              quantize_q8_0_f32_kernel<<<qg,32>>>(xq,xs,heads,group_dim,blocks_a);
+              grouped_q8_0_a_preq_warp8_kernel<<<((unsigned)low_dim+7u)/8u,256>>>(low,(const unsigned char*)aW,xq,xs,group_dim,rank,n_groups,1,blocks_a,dp4a);
+              quantize_q8_0_f32_kernel<<<(unsigned)blocks_b,32>>>(lowq,lows,low,low_dim,blocks_b);
+              matmul_q8_0_preq_warp8_kernel<<<((unsigned)n_embd+7u)/8u,256>>>(outF,(const unsigned char*)bW,lowq,lows,low_dim,n_embd,blocks_b,dp4a);
+              ok = cudaDeviceSynchronize()==cudaSuccess && cudaGetLastError()==cudaSuccess; }
+    std::vector<float> hF(n_embd);
+    if (ok) ok = cudaMemcpy(hF.data(),outF,n_embd*4,cudaMemcpyDeviceToHost)==cudaSuccess;
+
+    /* TP across k GPUs: gpr groups/rank; output_a col-shard (owned output rows),
+       output_b row-shard (owned input-block range), heads sub-range per rank. */
+    const uint32_t gpr = n_groups/(uint32_t)k;
+    const uint64_t low_pr = (uint64_t)gpr * rank;       /* owned attn_low rows */
+    const uint64_t bpr = blocks_b/(uint64_t)k;          /* owned output_b input blocks */
+    char *ash[8]={0},*bsh[8]={0}; float *hr[8]={0}; int8_t *xqr[8]={0},*lqr[8]={0}; float *xsr[8]={0},*lsr[8]={0};
+    float *lowr[8]={0},*pr[8]={0}; cudaStream_t st[8]={0};
+    char *packtmp=NULL; int devs[8]; for(int r=0;r<k;r++)devs[r]=r;
+    double rel=1.0;
+    if (ok) {
+        cudaSetDevice(0); ok = cudaMalloc(&packtmp,n_embd*bpr*34)==cudaSuccess;
+        for (int r=0;r<k && ok;r++) {
+            /* output_b row-shard: pack owned input blocks [r*bpr,(r+1)*bpr) of every out row */
+            ok = cudaMemcpy2D(packtmp,bpr*34,bW + (uint64_t)r*bpr*34,blocks_b*34,bpr*34,n_embd,cudaMemcpyDeviceToDevice)==cudaSuccess;
+            ok = ok && cudaSetDevice(r)==cudaSuccess && cudaStreamCreate(&st[r])==cudaSuccess;
+            ok = ok && cudaMalloc(&ash[r],low_pr*blocks_a*34)==cudaSuccess && cudaMalloc(&bsh[r],n_embd*bpr*34)==cudaSuccess
+                    && cudaMalloc(&hr[r],(uint64_t)gpr*group_dim*4)==cudaSuccess
+                    && cudaMalloc(&xqr[r],(uint64_t)gpr*blocks_a*32)==cudaSuccess && cudaMalloc(&xsr[r],(uint64_t)gpr*blocks_a*4)==cudaSuccess
+                    && cudaMalloc(&lowr[r],low_pr*4)==cudaSuccess
+                    && cudaMalloc(&lqr[r],bpr*32)==cudaSuccess && cudaMalloc(&lsr[r],bpr*4)==cudaSuccess
+                    && cudaMalloc(&pr[r],n_embd*4)==cudaSuccess;
+            /* output_a col-shard: owned output rows [r*gpr*rank,...) are contiguous */
+            ok = ok && cudaMemcpyPeer(ash[r],r,aW + (uint64_t)r*low_pr*blocks_a*34,0,low_pr*blocks_a*34)==cudaSuccess;
+            ok = ok && cudaMemcpyPeer(bsh[r],r,packtmp,0,n_embd*bpr*34)==cudaSuccess;
+            ok = ok && cudaMemcpyPeer(hr[r],r,heads + (uint64_t)r*gpr*group_dim,0,(uint64_t)gpr*group_dim*4)==cudaSuccess;
+            cudaSetDevice(0);
+        }
+        for(int r=0;r<k;r++){cudaSetDevice(r);cudaDeviceSynchronize();}
+        for (int r=0;r<k && ok;r++){ cudaSetDevice(r);
+            dim3 qg((unsigned)blocks_a,(unsigned)gpr,1);
+            quantize_q8_0_f32_kernel<<<qg,32,0,st[r]>>>(xqr[r],xsr[r],hr[r],group_dim,blocks_a);
+            grouped_q8_0_a_preq_warp8_kernel<<<((unsigned)low_pr+7u)/8u,256,0,st[r]>>>(lowr[r],(const unsigned char*)ash[r],xqr[r],xsr[r],group_dim,rank,gpr,1,blocks_a,dp4a);
+            quantize_q8_0_f32_kernel<<<(unsigned)bpr,32,0,st[r]>>>(lqr[r],lsr[r],lowr[r],low_pr,bpr);
+            matmul_q8_0_preq_warp8_kernel<<<((unsigned)n_embd+7u)/8u,256,0,st[r]>>>(pr[r],(const unsigned char*)bsh[r],lqr[r],lsr[r],low_pr,n_embd,bpr,dp4a);
+        }
+        for(int r=0;r<k;r++){cudaSetDevice(r);cudaStreamSynchronize(st[r]);}
+        if (ok) ok = ds4_gpu_tp_all_reduce_f32(devs,k,pr,(uint32_t)n_embd);
+        cudaSetDevice(0); std::vector<float> hT(n_embd);
+        if (ok) ok = cudaMemcpy(hT.data(),pr[0],n_embd*4,cudaMemcpyDeviceToHost)==cudaSuccess;
+        double maxabs=0,scale=0; for(uint64_t i=0;i<n_embd;i++){double a=fabs((double)hF[i]);if(a>scale)scale=a;double d=fabs((double)hF[i]-(double)hT[i]);if(d>maxabs)maxabs=d;}
+        if(scale<1e-12)scale=1e-12; rel=maxabs/scale;
+        cudaSetDevice(0); if(packtmp)cudaFree(packtmp);
+        for(int r=0;r<k;r++){cudaSetDevice(r);
+            if(ash[r])cudaFree(ash[r]);if(bsh[r])cudaFree(bsh[r]);if(hr[r])cudaFree(hr[r]);
+            if(xqr[r])cudaFree(xqr[r]);if(xsr[r])cudaFree(xsr[r]);if(lowr[r])cudaFree(lowr[r]);
+            if(lqr[r])cudaFree(lqr[r]);if(lsr[r])cudaFree(lsr[r]);if(pr[r])cudaFree(pr[r]);
+            if(st[r])cudaStreamDestroy(st[r]);}
+    }
+    fprintf(stderr, "ds4: TP grouped-O-proj jig k=%d groups=%u(gpr=%u) group_dim=%llu rank=%llu n_embd=%llu | %s rel=%.2e (1 all-reduce)\n",
+            k, n_groups, gpr, (unsigned long long)group_dim, (unsigned long long)rank, (unsigned long long)n_embd,
+            rel<1e-3?"PASS":"FAIL", rel);
+    cudaSetDevice(0); cudaFree(heads);cudaFree(xq);cudaFree(xs);cudaFree(low);cudaFree(lowq);cudaFree(lows);cudaFree(outF);
+    (void)cudaSetDevice(saved);
+    return (ok && rel<1e-3) ? 1 : 0;
+}
+
 /* TP RESIDENT-SHARD jig: validates the build-time shard-cache path the decode
  * will actually use. Unlike ds4_gpu_tp_matmul_jig (which reshards with transient
  * peer-copies inside the jig), this calls ds4_gpu_cache_col_shard /

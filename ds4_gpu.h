@@ -954,6 +954,15 @@ int ds4_gpu_tp_ffn_jig(
         uint64_t gate_off, uint64_t up_off, uint64_t down_off,
         uint64_t in_dim, uint64_t ff_dim, float clamp, int k);
 
+/* TP jig for the grouped MLA O-projection across k GPUs vs golden: output_a
+ * column-sharded over owned groups -> partial attn_low; output_b row-sharded over
+ * owned input blocks -> partial n_embd; one all-reduce. De-risks attention-TP. */
+int ds4_gpu_tp_oproj_jig(
+        const void *model_map, uint64_t model_size,
+        uint64_t out_a_off, uint64_t out_b_off,
+        uint64_t group_dim, uint64_t rank, uint32_t n_groups,
+        uint64_t n_embd, int k);
+
 /* ---- Tensor-Parallel resident weight shards ----
  * Cache one TP rank's shard of a Q8_0 [in_dim->out_dim] weight on the CURRENT
  * device. COL = contiguous output-row slice (column-parallel); ROW = packed

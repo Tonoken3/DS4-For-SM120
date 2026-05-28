@@ -17174,6 +17174,17 @@ static void ds4_tp_matmul_selftest(const ds4_model *model, const ds4_weights *we
         (void)ds4_gpu_tp_ffn_jig(model->map, model->size, gsx->abs_offset, usx->abs_offset,
                                  dsx->abs_offset, ffn_in, ffn_ff, DS4_SWIGLU_CLAMP_EXP, 4);
     }
+
+    /* TP grouped O-projection jig: attention-TP O-proj split (output_a col-shard
+     * over owned groups -> output_b row-shard -> all-reduce) vs golden. */
+    const ds4_tensor *oa = weights->layer[0].attn_output_a;
+    const ds4_tensor *ob = weights->layer[0].attn_output_b;
+    if (oa && ob && oa->type == DS4_TENSOR_Q8_0 && ob->type == DS4_TENSOR_Q8_0 &&
+        oa->ndim == 2 && ob->ndim == 2) {
+        const uint64_t group_dim = (uint64_t)DS4_N_HEAD_DIM * (DS4_N_HEAD / DS4_N_OUT_GROUP);
+        (void)ds4_gpu_tp_oproj_jig(model->map, model->size, oa->abs_offset, ob->abs_offset,
+                                   group_dim, DS4_N_LORA_O, DS4_N_OUT_GROUP, DS4_N_EMBD, 2);
+    }
 }
 
 /* TP MoE expert-parallel validation (env DS4_CUDA_TP_MATMUL_SELFTEST): the routed
@@ -17199,7 +17210,9 @@ static void ds4_tp_moe_selftest(const ds4_model *model, const ds4_weights *weigh
     const uint64_t down_expert_bytes = out_dim * down_row_bytes;
 
     const int k = 2;
-    const int n_sel = 8;
+    const int n_sel = (int)DS4_N_EXPERT_USED;   /* match real decode (6); both golden and
+                                                 * per-rank partials use the validated sumN
+                                                 * decode path (n_expert<=6). */
     int32_t sel[8]; float wt[8];
     for (int i = 0; i < n_sel; i++) {
         /* spread the selection across both id-halves so each rank owns some */

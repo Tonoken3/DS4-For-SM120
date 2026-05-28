@@ -10927,6 +10927,35 @@ __global__ static void moe_down_q4K_sum6_qwarp32_kernel(
     if (lane == 0) out[row] = total;
 }
 
+/* IQ2_XXS down-projection variant of the n_tokens==1 / 6-expert decode kernel.
+ * Mirrors moe_down_sum6_qwarp32_kernel but reads IQ2_XXS down weights. */
+__global__ static void moe_down_sum6_iq2xxs_qwarp32_kernel(
+        float *out,
+        const char *down_base,
+        const cuda_block_q8_K *midq,
+        const int32_t *selected,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        uint32_t midq_blocks,
+        uint32_t out_dim) {
+    uint32_t lane = threadIdx.x & 7u;
+    uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
+    if (row >= out_dim) return;
+    float total = 0.0f;
+    #pragma unroll
+    for (uint32_t slot = 0; slot < 6u; slot++) {
+        int32_t expert_i = selected[slot];
+        if (expert_i < 0) expert_i = 0;
+        const cuda_block_iq2_xxs *wr = (const cuda_block_iq2_xxs *)(down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes);
+        const cuda_block_q8_K *xq = midq + (uint64_t)slot * midq_blocks;
+        float acc = 0.0f;
+        for (uint32_t b = lane; b < midq_blocks; b += 8u) acc += dev_dot_iq2_xxs_q8_K_block(wr + b, xq + b);
+        acc = quarter_warp_sum_f32(acc, lane);
+        if (lane == 0) total += acc;
+    }
+    if (lane == 0) out[row] = total;
+}
+
 __global__ static void moe_down_sorted_qwarp32_kernel(
         float *down_out,
         const char *down_base,
@@ -11103,6 +11132,71 @@ __global__ static void moe_down_expert_tile8_row32_kernel(
                                  xqb[2] ? xqb[2] + b : NULL, xqb[3] ? xqb[3] + b : NULL,
                                  xqb[4] ? xqb[4] + b : NULL, xqb[5] ? xqb[5] + b : NULL,
                                  xqb[6] ? xqb[6] + b : NULL, xqb[7] ? xqb[7] + b : NULL, np, acc);
+    }
+    for (uint32_t p = 0; p < np; p++) {
+        acc[p] = quarter_warp_sum_f32(acc[p], lane);
+        if (lane == 0) {
+            if (atomic_out) {
+                uint32_t tok = pair[p] / n_expert;
+                atomicAdd(down_out + (uint64_t)tok * out_dim + row, acc[p]);
+            } else {
+                down_out[(uint64_t)pair[p] * out_dim + row] = acc[p];
+            }
+        }
+    }
+}
+
+/* IQ2_XXS down-projection variant of the batched tile8 path (n_tokens>1).
+ * Mirrors moe_down_expert_tile8_row32_kernel but reads IQ2_XXS down weights. */
+__global__ static void moe_down_expert_tile8_row32_iq2xxs_kernel(
+        float *down_out,
+        const char *down_base,
+        const cuda_block_q8_K *midq,
+        const uint32_t *sorted_pairs,
+        const uint32_t *offsets,
+        const uint32_t *counts,
+        const uint32_t *tile_total,
+        const uint32_t *tile_experts,
+        const uint32_t *tile_starts,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        uint32_t midq_blocks,
+        uint32_t out_dim,
+        uint32_t n_expert,
+        uint32_t atomic_out) {
+    uint32_t tile = blockIdx.y;
+    if (tile >= *tile_total) return;
+    uint32_t lane = threadIdx.x & 7u;
+    uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
+    uint32_t expert = tile_experts[tile];
+    uint32_t local_start = tile_starts[tile];
+    __shared__ cuda_block_q8_K sxq[8][8];
+    uint32_t pair[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    const cuda_block_q8_K *xqb[8] = {NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL};
+    uint32_t np = 0;
+    for (; np < 8u; np++) {
+        uint32_t local_pair = local_start + np;
+        if (local_pair >= counts[expert]) break;
+        pair[np] = sorted_pairs[offsets[expert] + local_pair];
+        xqb[np] = midq + (uint64_t)pair[np] * midq_blocks;
+    }
+    if (midq_blocks <= 8u) {
+        for (uint32_t i = threadIdx.x; i < np * midq_blocks; i += blockDim.x) {
+            uint32_t p = i / midq_blocks;
+            uint32_t b = i - p * midq_blocks;
+            sxq[p][b] = xqb[p][b];
+        }
+        __syncthreads();
+        for (uint32_t p = 0; p < np; p++) xqb[p] = sxq[p];
+    }
+    if (row >= out_dim) return;
+    const cuda_block_iq2_xxs *wr = (const cuda_block_iq2_xxs *)(down_base + (uint64_t)expert * down_expert_bytes + (uint64_t)row * down_row_bytes);
+    float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    for (uint32_t b = lane; b < midq_blocks; b += 8u) {
+        dev_dot_iq2_xxs_q8_K_block8(wr + b, xqb[0] ? xqb[0] + b : NULL, xqb[1] ? xqb[1] + b : NULL,
+                                    xqb[2] ? xqb[2] + b : NULL, xqb[3] ? xqb[3] + b : NULL,
+                                    xqb[4] ? xqb[4] + b : NULL, xqb[5] ? xqb[5] + b : NULL,
+                                    xqb[6] ? xqb[6] + b : NULL, xqb[7] ? xqb[7] + b : NULL, np, acc);
     }
     for (uint32_t p = 0; p < np; p++) {
         acc[p] = quarter_warp_sum_f32(acc[p], lane);
@@ -11568,7 +11662,10 @@ static int routed_moe_launch(
         return 0;
     }
     const int q4k_path = (gate_type == 12u && down_type == 12u);
-    if (!q4k_path && (gate_type != 16u || down_type != 10u)) return 0;
+    /* Supported expert quant combos: (gate Q4_K, down Q4_K), (gate IQ2_XXS,
+     * down Q2_K), or (gate IQ2_XXS, down IQ2_XXS). */
+    const int down_iq2xxs = (down_type == 16u);
+    if (!q4k_path && (gate_type != 16u || (down_type != 10u && down_type != 16u))) return 0;
     if (q4k_path && (n_tokens != 1u || n_expert != 6u)) return 0;
     const uint64_t gate_bytes = (uint64_t)n_total_expert * gate_expert_bytes;
     const uint64_t down_bytes = (uint64_t)n_total_expert * down_expert_bytes;
@@ -11805,7 +11902,8 @@ static int routed_moe_launch(
         const uint32_t pair_count = n_tokens * n_expert;
         const uint32_t use_sorted_pairs = n_tokens > 1u;
         const uint32_t use_expert_tiles = use_sorted_pairs && getenv("DS4_CUDA_MOE_NO_EXPERT_TILES") == NULL;
-        const uint32_t expert_tile_m = getenv("DS4_CUDA_MOE_TILE4") ? 4u : 8u;
+        /* IQ2_XXS down only has tile8 + sum6 variants, so force tile8 (not tile4/16). */
+        const uint32_t expert_tile_m = (getenv("DS4_CUDA_MOE_TILE4") && !down_iq2xxs) ? 4u : 8u;
         const uint32_t write_gate_up = getenv("DS4_CUDA_MOE_WRITE_GATE_UP") != NULL;
         const uint32_t use_p2_sorted = use_sorted_pairs && getenv("DS4_CUDA_MOE_NO_P2") == NULL;
         const uint32_t use_atomic_down = use_expert_tiles &&
@@ -11819,7 +11917,7 @@ static int routed_moe_launch(
               getenv("DS4_CUDA_MOE_NO_GATE_ROW2048") == NULL &&
               getenv("DS4_CUDA_MOE_NO_GATE_ROW256") == NULL &&
               getenv("DS4_CUDA_MOE_NO_GATE_ROW128") == NULL));
-        const uint32_t use_down_tile16 = use_atomic_down && expert_tile_m == 8u &&
+        const uint32_t use_down_tile16 = use_atomic_down && expert_tile_m == 8u && !down_iq2xxs &&
             n_tokens >= 128u && getenv("DS4_CUDA_MOE_NO_DOWN_TILE16") == NULL;
         const uint32_t use_decode_lut_gate =
             n_tokens == 1u && xq_blocks <= 16u &&
@@ -11830,7 +11928,7 @@ static int routed_moe_launch(
         const uint32_t down_row_span =
             getenv("DS4_CUDA_MOE_DOWN_ROW512") != NULL ? 512u :
             getenv("DS4_CUDA_MOE_DOWN_ROW1024") != NULL ? 1024u : 2048u;
-        const uint32_t use_down_row2048 = use_atomic_down && expert_tile_m == 8u &&
+        const uint32_t use_down_row2048 = use_atomic_down && expert_tile_m == 8u && !down_iq2xxs &&
             (getenv("DS4_CUDA_MOE_DOWN_ROW2048") != NULL ||
              getenv("DS4_CUDA_MOE_DOWN_ROW256") != NULL ||
              getenv("DS4_CUDA_MOE_DOWN_ROW128") != NULL ||
@@ -12109,6 +12207,16 @@ static int routed_moe_launch(
                         down_row_bytes,
                         midq_blocks,
                         out_dim);
+                } else if (down_iq2xxs) {
+                    moe_down_sum6_iq2xxs_qwarp32_kernel<<<sgrid, 256, 0, ds4_decode_stream()>>>(
+                        (float *)out->ptr,
+                        down_w,
+                        midq,
+                        selected_ptr,
+                        down_expert_bytes,
+                        down_row_bytes,
+                        midq_blocks,
+                        out_dim);
                 } else {
                     moe_down_sum6_qwarp32_kernel<<<sgrid, 256, 0, ds4_decode_stream()>>>(
                         (float *)out->ptr,
@@ -12155,6 +12263,13 @@ static int routed_moe_launch(
                 } else if (use_down_tile16) {
                     dim3 tgrid((out_dim + 31u) / 32u, down_tile_capacity, 1);
                     moe_down_expert_tile16_row32_kernel<<<tgrid, 256, 0, ds4_decode_stream()>>>(
+                        use_atomic_down ? (float *)out->ptr : (float *)down->ptr,
+                        down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
+                        down_tile_total, down_tile_experts, down_tile_starts, down_expert_bytes, down_row_bytes,
+                        midq_blocks, out_dim, n_expert, use_atomic_down);
+                } else if (expert_tile_m == 8u && down_iq2xxs) {
+                    dim3 tgrid((out_dim + 31u) / 32u, down_tile_capacity, 1);
+                    moe_down_expert_tile8_row32_iq2xxs_kernel<<<tgrid, 256, 0, ds4_decode_stream()>>>(
                         use_atomic_down ? (float *)out->ptr : (float *)down->ptr,
                         down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
                         down_tile_total, down_tile_experts, down_tile_starts, down_expert_bytes, down_row_bytes,

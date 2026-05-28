@@ -12012,39 +12012,39 @@ static bool metal_graph_encode_token_raw_swa_tp(
                   weights->token_embd->abs_offset, (uint32_t)weights->token_embd->dim[1],
                   (uint32_t)token, DS4_N_EMBD, DS4_N_HC) != 0;
     if (ok) ok = ds4_gpu_synchronize() != 0;
+    /* deliver the embedded cur_hc to stage 0's other ranks (A1: every rank runs the
+     * full attention itself, from the identical layer input — no per-layer broadcast). */
+    for (int r = 1; ok && r < tp; r++) {
+        ok = ds4_gpu_pp_p2p_copy_ptr(r, 0, ds4_gpu_tensor_device_ptr(pp[r].g.cur_hc),
+                ds4_gpu_tensor_device_ptr(g0->cur_hc), ds4_gpu_tensor_bytes(g0->cur_hc)) != 0;
+    }
+    if (ok) ok = ds4_gpu_synchronize() != 0;
 
+    const bool tp_prof = getenv("DS4_TP_PROFILE") != NULL;
+    double tpf_cmp = 0.0, tpf_ar = 0.0, tpf_cmb = 0.0, tpf_t;
     for (int s = 0; ok && s < nstage; s++) {
-        const int r0 = s * tp;                 /* attention/router rank of the stage */
+        const int r0 = s * tp;
         const int l0 = pp[r0].layer_start, l1 = pp[r0].layer_end;
         for (int il = l0; ok && il <= l1; il++) {
-            ds4_gpu_graph *gg0 = &pp[r0].g;
-            /* (1) attention + router on rank0 (layer_part==3 stops after the router) */
-            ds4_gpu_pp_set_device(r0);
-            ok = metal_graph_encode_decode_layer(gg0, model, &weights->layer[il], (uint32_t)il,
-                     pos, gg0->layer_raw_cache[il], gg0->raw_cap, raw_row, n_raw, token, false, 3);
-            if (ok) ok = ds4_gpu_synchronize() != 0;
-            /* (2) broadcast the FFN-part inputs rank0 -> each other rank of the stage */
-            for (int r = 1; ok && r < tp; r++) {
+            /* (1) attention+router AND (2) FFN/MoE partial on EVERY rank. A1: each
+             * rank runs the full attention from the identical cur_hc, so they all
+             * produce bit-identical ffn_norm/after_attn_hc/hc_split/router — no
+             * broadcast. part3 then part2 are on the same per-rank stream (ordered),
+             * so no sync between them. The router selection is filtered to this
+             * rank's owned experts inside part2. */
+            tpf_t = tp_prof ? now_sec() : 0.0;
+            for (int r = 0; ok && r < tp; r++) {
                 const int rr = s * tp + r;
                 ds4_gpu_graph *ggr = &pp[rr].g;
-#define TP_BCAST(field) do { if (ok) ok = ds4_gpu_pp_p2p_copy_ptr(rr, r0, \
-        ds4_gpu_tensor_device_ptr(ggr->field), ds4_gpu_tensor_device_ptr(gg0->field), \
-        ds4_gpu_tensor_bytes(gg0->field)) != 0; } while (0)
-                TP_BCAST(ffn_norm);
-                TP_BCAST(after_attn_hc);
-                TP_BCAST(hc_split);
-                TP_BCAST(router_selected);
-                TP_BCAST(router_weights);
-#undef TP_BCAST
-            }
-            /* (3) FFN/MoE partial on every rank (each reads only its owned shards) */
-            for (int r = 0; ok && r < tp; r++) {
-                ds4_gpu_pp_set_device(s * tp + r);
-                ok = metal_graph_tp_ffn_part2(&pp[s * tp + r].g, model, &weights->layer[il],
-                                              (uint32_t)il, pos);
+                ds4_gpu_pp_set_device(rr);
+                ok = metal_graph_encode_decode_layer(ggr, model, &weights->layer[il], (uint32_t)il,
+                         pos, ggr->layer_raw_cache[il], ggr->raw_cap, raw_row, n_raw, token, false, 3);
+                if (ok) ok = metal_graph_tp_ffn_part2(ggr, model, &weights->layer[il], (uint32_t)il, pos);
             }
             for (int r = 0; ok && r < tp; r++) { ds4_gpu_pp_set_device(s * tp + r); ok = ok && ds4_gpu_synchronize() != 0; }
-            /* (4) all-reduce routed_out and shared_out across the stage's ranks */
+            if (tp_prof) tpf_cmp += now_sec() - tpf_t;
+            /* (3) all-reduce routed_out and shared_out across the stage's ranks */
+            tpf_t = tp_prof ? now_sec() : 0.0;
             {
                 int devs[8];
                 float *rbuf[8], *sbuf[8];
@@ -12056,7 +12056,9 @@ static bool metal_graph_encode_token_raw_swa_tp(
                 if (ok) ok = ds4_gpu_tp_all_reduce_f32(devs, tp, rbuf, (uint32_t)DS4_N_EMBD) != 0;
                 if (ok) ok = ds4_gpu_tp_all_reduce_f32(devs, tp, sbuf, (uint32_t)DS4_N_EMBD) != 0;
             }
-            /* (5) combine on every rank (unfused == fused shared_down_hc), then swap */
+            if (tp_prof) tpf_ar += now_sec() - tpf_t;
+            /* (4) combine on every rank (unfused == fused shared_down_hc), then swap */
+            tpf_t = tp_prof ? now_sec() : 0.0;
             for (int r = 0; ok && r < tp; r++) {
                 const int rr = s * tp + r;
                 ds4_gpu_graph *ggr = &pp[rr].g;
@@ -12066,16 +12068,23 @@ static bool metal_graph_encode_token_raw_swa_tp(
                 ds4_gpu_tensor *tmp = ggr->cur_hc; ggr->cur_hc = ggr->after_ffn_hc; ggr->after_ffn_hc = tmp;
             }
             for (int r = 0; ok && r < tp; r++) { ds4_gpu_pp_set_device(s * tp + r); ok = ok && ds4_gpu_synchronize() != 0; }
+            if (tp_prof) tpf_cmb += now_sec() - tpf_t;
         }
-        /* P2P stage output (rank0 cur_hc) -> next stage rank0 */
+        /* P2P stage output (rank0 cur_hc) -> ALL ranks of the next stage (A1) */
         if (ok && s + 1 < nstage) {
-            const int nr0 = (s + 1) * tp;
-            ds4_gpu_synchronize();
-            ok = ds4_gpu_pp_p2p_copy_ptr(nr0, r0,
-                    ds4_gpu_tensor_device_ptr(pp[nr0].g.cur_hc),
-                    ds4_gpu_tensor_device_ptr(pp[r0].g.cur_hc),
-                    ds4_gpu_tensor_bytes(pp[r0].g.cur_hc)) != 0;
+            for (int r = 0; ok && r < tp; r++) {
+                const int nr = (s + 1) * tp + r;
+                ok = ds4_gpu_pp_p2p_copy_ptr(nr, r0,
+                        ds4_gpu_tensor_device_ptr(pp[nr].g.cur_hc),
+                        ds4_gpu_tensor_device_ptr(pp[r0].g.cur_hc),
+                        ds4_gpu_tensor_bytes(pp[r0].g.cur_hc)) != 0;
+            }
+            if (ok) ok = ds4_gpu_synchronize() != 0;
         }
+    }
+    if (tp_prof) {
+        fprintf(stderr, "ds4: TP profile (token, ms): compute(attn+ffn+moe)=%.2f all_reduce=%.2f combine=%.2f\n",
+                tpf_cmp * 1000.0, tpf_ar * 1000.0, tpf_cmb * 1000.0);
     }
 
     /* logits on the output-head device (ngpu-1). Both ranks of the last stage hold

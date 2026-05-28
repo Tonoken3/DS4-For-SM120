@@ -10047,6 +10047,45 @@ extern "C" int ds4_gpu_attention_output_low_q8_tensor(
                                                       use_dp4a);
     return cuda_ok(cudaGetLastError(), "attention_output_low_q8 launch");
 }
+/* Tensor-Parallel grouped O-proj output_a: like ds4_gpu_attention_output_low_q8_tensor
+ * but reads this rank's COL-shard of output_a from the resident g_tp_shards registry
+ * (owned groups' contiguous output rows) instead of the full model_map tensor. The
+ * shard holds out_rows = gpr*rank output rows for gpr = out_rows/rank owned groups;
+ * `heads` is this rank's owned heads compacted at [0, gpr*group_dim). Produces this
+ * rank's partial attn_low (gpr*rank); the caller row-parallels output_b + all-reduces. */
+extern "C" int ds4_gpu_tp_attention_output_low_q8_tensor(
+        ds4_gpu_tensor       *low,
+        const void             *model_map,
+        uint64_t                out_a_parent_offset,
+        uint64_t                rank,
+        const ds4_gpu_tensor *heads) {
+    if (!low || !heads || !model_map || rank == 0) return 0;
+    int kind = -1; uint64_t out_rows = 0, group_dim = 0, blocks_a = 0;
+    const char *out_a = cuda_tp_shard_ptr(model_map, out_a_parent_offset, &kind, &out_rows, &group_dim, &blocks_a);
+    if (!out_a || kind != DS4_TP_SHARD_COL || group_dim == 0 || (out_rows % rank) != 0) return 0;
+    const uint32_t n_groups = (uint32_t)(out_rows / rank);   /* owned groups (gpr) */
+    if (n_groups == 0) return 0;
+    if (heads->bytes < (uint64_t)n_groups * group_dim * sizeof(float) ||
+        low->bytes < out_rows * sizeof(float)) {
+        return 0;
+    }
+    const uint64_t x_rows = (uint64_t)n_groups;
+    const uint64_t xq_bytes = x_rows * blocks_a * 32u;
+    const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
+    void *tmp = cuda_tmp_alloc(scale_offset + x_rows * blocks_a * sizeof(float), "tp attn out low prequant");
+    if (!tmp) return 0;
+    int8_t *xq = (int8_t *)tmp;
+    float *xscale = (float *)((char *)tmp + scale_offset);
+    const int use_dp4a = cuda_q8_use_dp4a();
+    dim3 qgrid((unsigned)blocks_a, (unsigned)x_rows, 1);
+    quantize_q8_0_f32_kernel<<<qgrid, 32, 0, ds4_decode_stream()>>>(xq, xscale,
+                                            (const float *)heads->ptr, group_dim, blocks_a);
+    if (!cuda_ok(cudaGetLastError(), "tp attn out low prequant launch")) return 0;
+    grouped_q8_0_a_preq_warp8_kernel<<<((unsigned)out_rows + 7u) / 8u, 256, 0, ds4_decode_stream()>>>(
+            (float *)low->ptr, reinterpret_cast<const unsigned char *>(out_a),
+            xq, xscale, group_dim, rank, n_groups, 1, blocks_a, use_dp4a);
+    return cuda_ok(cudaGetLastError(), "tp attn out low launch");
+}
 extern "C" int ds4_gpu_swiglu_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *gate, const ds4_gpu_tensor *up, uint32_t n, float clamp, float weight) {
     if (!out || !gate || !up ||
         out->bytes < (uint64_t)n * sizeof(float) ||

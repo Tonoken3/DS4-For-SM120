@@ -954,6 +954,14 @@ int ds4_gpu_tp_ffn_jig(
         uint64_t gate_off, uint64_t up_off, uint64_t down_off,
         uint64_t in_dim, uint64_t ff_dim, float clamp, int k);
 
+/* TP grouped O-proj output_a: reads this rank's COL-shard of attn_output_a from
+ * g_tp_shards (owned groups' output rows) and computes its partial attn_low from the
+ * owned heads (compacted at [0,gpr*group_dim)). out_a_parent_offset = the full
+ * tensor's abs_offset (shard registry key); rank = N_LORA_O. */
+int ds4_gpu_tp_attention_output_low_q8_tensor(
+        ds4_gpu_tensor *low, const void *model_map,
+        uint64_t out_a_parent_offset, uint64_t rank, const ds4_gpu_tensor *heads);
+
 /* TP jig for the grouped MLA O-projection across k GPUs vs golden: output_a
  * column-sharded over owned groups -> partial attn_low; output_b row-sharded over
  * owned input blocks -> partial n_embd; one all-reduce. De-risks attention-TP. */

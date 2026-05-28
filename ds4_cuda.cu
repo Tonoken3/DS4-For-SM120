@@ -543,7 +543,6 @@ struct cuda_q8_f32_range {
 enum cuda_tp_shard_kind {
     DS4_TP_SHARD_COL = 0,    /* contiguous output-row slice (column-parallel)  */
     DS4_TP_SHARD_ROW = 1,    /* packed input-block slice    (row-parallel)     */
-    DS4_TP_SHARD_EXPERT = 2, /* contiguous expert subset    (expert-parallel)  */
 };
 struct cuda_tp_shard {
     const void *host_base;  /* model_map of the parent tensor                  */
@@ -557,9 +556,6 @@ struct cuda_tp_shard {
     uint64_t out_dim;       /* COL: rows on this rank; ROW: full out_dim       */
     uint64_t in_dim;        /* COL: full in_dim; ROW: this rank's in (bpr*32)  */
     uint64_t blocks;        /* COL: full blocks; ROW: this rank's blocks (bpr) */
-    uint64_t expert_base;   /* EXPERT: global id of first owned expert         */
-    uint64_t expert_count;  /* EXPERT: experts owned by this rank              */
-    uint64_t expert_bytes;  /* EXPERT: bytes per single expert                 */
 };
 
 static std::vector<cuda_model_range> g_model_ranges;
@@ -2593,7 +2589,6 @@ extern "C" int ds4_gpu_cache_col_shard(
     s.host_base = model_map; s.offset = offset; s.rank = rank; s.k = k;
     s.kind = DS4_TP_SHARD_COL; s.device = cur; s.device_ptr = (char *)dev; s.bytes = shard_bytes;
     s.out_dim = rpr; s.in_dim = in_dim; s.blocks = blocks;
-    s.expert_base = 0; s.expert_count = 0; s.expert_bytes = 0;
     g_tp_shards.push_back(s);
     g_tp_shard_bytes += shard_bytes;
     return 1;
@@ -2643,74 +2638,18 @@ extern "C" int ds4_gpu_cache_row_shard(
     s.host_base = model_map; s.offset = offset; s.rank = rank; s.k = k;
     s.kind = DS4_TP_SHARD_ROW; s.device = cur; s.device_ptr = (char *)dev; s.bytes = shard_bytes;
     s.out_dim = out_dim; s.in_dim = bpr * 32; s.blocks = bpr;
-    s.expert_base = 0; s.expert_count = 0; s.expert_bytes = 0;
     g_tp_shards.push_back(s);
     g_tp_shard_bytes += shard_bytes;
     return 1;
 }
 
-/* Cache an EXPERT-parallel shard of a routed-expert 3D tensor (any quant type)
- * on the current device: rank r owns the contiguous expert range
- * [r*ec,(r+1)*ec), ec=n_expert/k. Experts are the outermost (slowest) dim, so a
- * single expert is a contiguous byte block (total_bytes/n_expert) and the owned
- * range is one contiguous H2D copy. Format-agnostic (Q2_K / IQ2_XXS / ...). */
-extern "C" int ds4_gpu_cache_expert_shard(
-        const void *model_map, uint64_t model_size,
-        uint64_t offset, uint64_t total_bytes, uint64_t n_expert,
-        int rank, int k, const char *label) {
-    if (!model_map || total_bytes == 0 || n_expert == 0 || k < 1 || rank < 0 || rank >= k) return 0;
-    if ((n_expert % (uint64_t)k) != 0 || (total_bytes % n_expert) != 0) {
-        fprintf(stderr, "ds4: expert-shard %s: n_expert(%llu)/bytes(%llu) not splittable by k=%d\n",
-                label ? label : "?", (unsigned long long)n_expert,
-                (unsigned long long)total_bytes, k);
-        return 0;
-    }
-    const uint64_t bpe = total_bytes / n_expert;
-    const uint64_t ec = n_expert / (uint64_t)k;
-    const uint64_t e0 = (uint64_t)rank * ec;
-    const uint64_t shard_bytes = ec * bpe;
-    const uint64_t src_off = offset + e0 * bpe;
-    if (src_off > model_size || shard_bytes > model_size - src_off) return 0;
-    void *dev = NULL;
-    cudaError_t err = cudaMalloc(&dev, (size_t)shard_bytes);
-    if (err != cudaSuccess) {
-        (void)cudaGetLastError();
-        fprintf(stderr, "ds4: expert-shard %s alloc failed (%.2f MiB): %s\n",
-                label ? label : "?", (double)shard_bytes / 1048576.0, cudaGetErrorString(err));
-        return 0;
-    }
-    err = cudaMemcpy(dev, (const char *)model_map + src_off, (size_t)shard_bytes, cudaMemcpyHostToDevice);
-    if (err != cudaSuccess) {
-        fprintf(stderr, "ds4: expert-shard %s copy failed: %s\n", label ? label : "?", cudaGetErrorString(err));
-        (void)cudaFree(dev); (void)cudaGetLastError();
-        return 0;
-    }
-    int cur = -1; (void)cudaGetDevice(&cur);
-    cuda_tp_shard s;
-    s.host_base = model_map; s.offset = offset; s.rank = rank; s.k = k;
-    s.kind = DS4_TP_SHARD_EXPERT; s.device = cur; s.device_ptr = (char *)dev; s.bytes = shard_bytes;
-    s.out_dim = 0; s.in_dim = 0; s.blocks = 0;
-    s.expert_base = e0; s.expert_count = ec; s.expert_bytes = bpe;
-    g_tp_shards.push_back(s);
-    g_tp_shard_bytes += shard_bytes;
-    return 1;
-}
-
-/* Resolve an EXPERT shard for the current device; fills expert base/count/bytes. */
-static const char *cuda_tp_expert_shard_ptr(const void *model_map, uint64_t offset,
-                                            uint64_t *e0, uint64_t *ec, uint64_t *bpe) {
-    int cur = -1; (void)cudaGetDevice(&cur);
-    for (const cuda_tp_shard &s : g_tp_shards) {
-        if (s.host_base == model_map && s.offset == offset && s.device == cur &&
-            s.kind == DS4_TP_SHARD_EXPERT) {
-            if (e0) *e0 = s.expert_base;
-            if (ec) *ec = s.expert_count;
-            if (bpe) *bpe = s.expert_bytes;
-            return s.device_ptr;
-        }
-    }
-    return NULL;
-}
+/* NOTE: routed-expert (MoE) sharding does NOT use g_tp_shards. The owned expert
+ * subset [r*ec,(r+1)*ec) is one contiguous byte range, so the TP cache loop
+ * force-caches it in g_model_ranges at its natural sub-offset (gate_offset +
+ * e0*expert_bytes). The UNCHANGED routed_moe then addresses experts as
+ * gate_offset + gid*expert_bytes and transparently resolves owned experts within
+ * that cached sub-range; the decode encode filters the router selection to the
+ * owned id-range (non-owned remapped to the first owned expert with weight 0). */
 
 extern "C" void ds4_gpu_tp_shards_release_all(void) {
     int saved = -1; (void)cudaGetDevice(&saved);
@@ -7926,6 +7865,34 @@ extern "C" int ds4_gpu_tp_row_matmul_tensor(
             (float *)out->ptr, reinterpret_cast<const unsigned char *>(wptr),
             xq, xscale, in_slice, out_dim, blocks, 0, blocks, add_to, use_dp4a);
     return cuda_ok(cudaGetLastError(), "tp_row matmul");
+}
+
+/* Filter a token's router selection to this rank's owned expert range for TP MoE
+ * expert-parallelism: any selected expert outside [e0, e0+ec) is remapped to e0
+ * (a resident owned expert) with weight 0, so the UNCHANGED routed_moe reads only
+ * resident (owned) experts and the zero-weight sentinels contribute nothing.
+ * Summing every rank's partial (all-reduce) reproduces the full MoE output.
+ * Run per-rank, in place on that rank's replicated router selection. */
+__global__ void tp_filter_experts_kernel(int32_t *selected, float *weights,
+                                         uint32_t n_sel, uint32_t e0, uint32_t ec) {
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_sel) return;
+    int32_t gid = selected[i];
+    if (gid < (int32_t)e0 || gid >= (int32_t)(e0 + ec)) {
+        selected[i] = (int32_t)e0;
+        weights[i] = 0.0f;
+    }
+}
+
+extern "C" int ds4_gpu_tp_filter_experts_tensor(
+        ds4_gpu_tensor *selected, ds4_gpu_tensor *weights,
+        uint32_t n_sel, uint32_t e0, uint32_t ec) {
+    if (!selected || !weights || n_sel == 0 || ec == 0) return 0;
+    if (selected->bytes < (uint64_t)n_sel * sizeof(int32_t) ||
+        weights->bytes < (uint64_t)n_sel * sizeof(float)) return 0;
+    tp_filter_experts_kernel<<<(n_sel + 31u) / 32u, 32, 0, ds4_decode_stream()>>>(
+            (int32_t *)selected->ptr, (float *)weights->ptr, n_sel, e0, ec);
+    return cuda_ok(cudaGetLastError(), "tp_filter_experts");
 }
 
 /* ---- Tensor-Parallel validation/benchmark jig (Q8_0 matmul) ----

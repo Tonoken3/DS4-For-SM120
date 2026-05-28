@@ -17177,9 +17177,21 @@ static int generate_metal_graph_raw_swa(
                                         t->abs_offset, in_dim, out_dim, rank, tp, label);
                             }
                         } else if (ds4_str_contains(t->name, "exps")) {
+                            /* Expert-parallel: rank r owns experts [r*ec,(r+1)*ec).
+                             * Experts are the outermost dim, so the owned subset is
+                             * one contiguous byte range. Cache it in g_model_ranges
+                             * at its natural sub-offset so the UNCHANGED routed_moe
+                             * (which addresses experts as gate_offset + gid*expert_bytes)
+                             * transparently reads the owned experts; the encode filters
+                             * the router selection to this rank's owned range. */
                             uint64_t n_expert = (t->ndim >= 3) ? t->dim[t->ndim - 1] : (uint64_t)DS4_N_EXPERT;
-                            sharded = ds4_gpu_cache_expert_shard(model->map, model->size,
-                                    t->abs_offset, t->bytes, n_expert, rank, tp, label);
+                            if (n_expert > 0 && (n_expert % (uint64_t)tp) == 0 && (t->bytes % n_expert) == 0) {
+                                uint64_t bpe = t->bytes / n_expert;
+                                uint64_t ec  = n_expert / (uint64_t)tp;
+                                uint64_t e0  = (uint64_t)rank * ec;
+                                sharded = ds4_gpu_cache_model_range_force(model->map, model->size,
+                                        t->abs_offset + e0 * bpe, ec * bpe, label);
+                            }
                         }
                         if (sharded) total_cached += t->bytes / (uint64_t)tp;
                     }

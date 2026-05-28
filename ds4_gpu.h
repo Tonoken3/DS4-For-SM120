@@ -965,11 +965,8 @@ int ds4_gpu_cache_col_shard(const void *model_map, uint64_t model_size,
 int ds4_gpu_cache_row_shard(const void *model_map, uint64_t model_size,
                             uint64_t offset, uint64_t in_dim, uint64_t out_dim,
                             int rank, int k, const char *label);
-/* Expert-parallel shard of a routed-expert 3D tensor (any quant): rank r owns
- * the contiguous expert subset [r*n_expert/k, ...). */
-int ds4_gpu_cache_expert_shard(const void *model_map, uint64_t model_size,
-                               uint64_t offset, uint64_t total_bytes, uint64_t n_expert,
-                               int rank, int k, const char *label);
+/* (Routed-expert MoE sharding uses ds4_gpu_cache_model_range_force at the owned
+ * expert sub-offset in g_model_ranges, not a g_tp_shards entry — see ds4_cuda.cu.) */
 void ds4_gpu_tp_shards_release_all(void);
 
 /* TP shard matmuls used by the TP decode encode: resolve the current device's
@@ -980,6 +977,12 @@ int ds4_gpu_tp_col_matmul_tensor(ds4_gpu_tensor *out, const void *model_map,
                                  uint64_t weight_offset, const ds4_gpu_tensor *x);
 int ds4_gpu_tp_row_matmul_tensor(ds4_gpu_tensor *out, const void *model_map,
                                  uint64_t weight_offset, int add_to, const ds4_gpu_tensor *x);
+
+/* TP MoE: remap a token's selected experts outside [e0,e0+ec) to e0 with weight 0
+ * so routed_moe reads only this rank's owned (resident) experts; all-reduce of the
+ * per-rank partials reproduces the full MoE output. In place on router selection. */
+int ds4_gpu_tp_filter_experts_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights,
+                                     uint32_t n_sel, uint32_t e0, uint32_t ec);
 
 /* TP resident-shard jig: validates the build-time shard-cache -> accessor ->
  * matmul path (col + row parallel) reproduces the single-GPU golden. */

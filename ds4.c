@@ -17478,6 +17478,25 @@ static int generate_metal_graph_raw_swa(
         fprintf(stderr, "ds4: CUDA greedy GPU argmax enabled\n");
     }
     int next_token = sample_argmax(logits, DS4_N_VOCAB);
+    /* TP-vs-PP teacher-forced agreement harness (validation, env-gated):
+     * DS4_WRITE_TOKENS=<file> records the greedy pick stream (run on PP);
+     * DS4_FORCE_TOKENS=<file> replays it teacher-forced (run on TP) and reports
+     * per-step top-1 agreement + the top1-top2 gap at disagreements (small gap =>
+     * the model itself was a near-tie there, i.e. the divergence is benign). */
+    int32_t *tf_ref = NULL; long tf_ref_n = 0, tf_idx = 0;
+    int tf_agree = 0, tf_total = 0, tf_dis_smallgap = 0; double tf_dis_gap_sum = 0.0;
+    const char *tf_force = getenv("DS4_FORCE_TOKENS");
+    if (tf_force && tf_force[0]) {
+        FILE *f = fopen(tf_force, "rb");
+        if (f) { fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+                 tf_ref_n = sz / 4; tf_ref = (int32_t *)malloc((size_t)sz);
+                 if (tf_ref && fread(tf_ref, 4, (size_t)tf_ref_n, f) != (size_t)tf_ref_n) { free(tf_ref); tf_ref = NULL; }
+                 fclose(f); }
+        if (tf_ref && tf_ref_n > 0) { next_token = tf_ref[0]; tf_idx = 1; }
+    }
+    int32_t *tf_wr = NULL; int tf_wr_n = 0;
+    const char *tf_write = getenv("DS4_WRITE_TOKENS");
+    if (tf_write && tf_write[0]) { tf_wr = (int32_t *)malloc((size_t)(n_predict + 2) * 4); if (tf_wr) tf_wr[tf_wr_n++] = next_token; }
     const double t_decode0 = now_sec();
     for (int i = 0; i < n_predict && pos < ctx_size; i++) {
         if (trace_top) {
@@ -17523,6 +17542,18 @@ static int generate_metal_graph_raw_swa(
                 }
             }
             if (ok) next_token = sample_argmax(logits, DS4_N_VOCAB);
+            if (ok && tf_wr && tf_wr_n < n_predict + 2) tf_wr[tf_wr_n++] = next_token;
+            if (ok && tf_ref) {
+                const int tp_pick = next_token;
+                const int ref_pick = (tf_idx < tf_ref_n) ? tf_ref[tf_idx] : tp_pick;
+                float m1 = -1e30f, m2 = -1e30f;
+                for (int v = 0; v < DS4_N_VOCAB; v++) { float x = logits[v]; if (x > m1) { m2 = m1; m1 = x; } else if (x > m2) m2 = x; }
+                tf_total++;
+                if (tp_pick == ref_pick) tf_agree++;
+                else { tf_dis_gap_sum += (double)(m1 - m2); if ((m1 - m2) < 0.5f) tf_dis_smallgap++; }
+                next_token = ref_pick;  /* teacher-force PP's pick so both paths stay aligned */
+                tf_idx++;
+            }
         }
         if (!ok) break;
         if (token_timing) {
@@ -17533,6 +17564,20 @@ static int generate_metal_graph_raw_swa(
         pos++;
     }
     const double t_decode1 = now_sec();
+    if (tf_ref) {
+        const int dis = tf_total - tf_agree;
+        fprintf(stderr, "ds4: TF agreement: %d/%d (%.1f%%) match PP; disagreements=%d avg_top1_top2_gap=%.3f smallgap(<0.5)=%d\n",
+                tf_agree, tf_total, tf_total ? 100.0 * tf_agree / tf_total : 0.0,
+                dis, dis ? tf_dis_gap_sum / dis : 0.0, tf_dis_smallgap);
+        free(tf_ref);
+    }
+    if (tf_wr) {
+        FILE *f = fopen(tf_write, "wb");
+        if (f) { if (fwrite(tf_wr, 4, (size_t)tf_wr_n, f) == (size_t)tf_wr_n)
+                     fprintf(stderr, "ds4: wrote %d picks to %s\n", tf_wr_n, tf_write);
+                 fclose(f); }
+        free(tf_wr);
+    }
     if (done) done(emit_ud);
 
     const double prefill_s = t_prefill1 - t_prefill0;

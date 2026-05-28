@@ -972,6 +972,15 @@ int ds4_gpu_cache_expert_shard(const void *model_map, uint64_t model_size,
                                int rank, int k, const char *label);
 void ds4_gpu_tp_shards_release_all(void);
 
+/* TP shard matmuls used by the TP decode encode: resolve the current device's
+ * shard for (model_map, weight_offset) and run the Q8_0 kernel with its dims.
+ * col: out=out_dim/k rows from full input (no all-reduce). row: out=full out_dim
+ * partial from this rank's input slice (caller all-reduces; add_to accumulates). */
+int ds4_gpu_tp_col_matmul_tensor(ds4_gpu_tensor *out, const void *model_map,
+                                 uint64_t weight_offset, const ds4_gpu_tensor *x);
+int ds4_gpu_tp_row_matmul_tensor(ds4_gpu_tensor *out, const void *model_map,
+                                 uint64_t weight_offset, int add_to, const ds4_gpu_tensor *x);
+
 /* TP resident-shard jig: validates the build-time shard-cache -> accessor ->
  * matmul path (col + row parallel) reproduces the single-GPU golden. */
 int ds4_gpu_tp_shard_jig(

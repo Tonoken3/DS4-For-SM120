@@ -7867,6 +7867,67 @@ extern "C" int ds4_gpu_matmul_q8_0_brange_tensor(
     return cuda_ok(cudaGetLastError(), "matmul_q8_0_brange launch");
 }
 
+/* ---- Tensor-Parallel shard matmuls (read the resident g_tp_shards entry) ----
+ * The TP decode encode calls these instead of ds4_gpu_matmul_q8_0_tensor for the
+ * sharded weights: they resolve the CURRENT device's shard for (model_map,
+ * weight_offset) and run the validated Q8_0 kernel with the shard's own dims.
+ * Underlying kernels + the shard accessor are already jig-validated; these are
+ * the thin tensor-level plumbing the encode needs. */
+
+/* Column-parallel: out[out_dim/k] = colshard(W) . x (full input, in_dim). Each
+ * rank produces its own output-row slice; no all-reduce (the slices are disjoint
+ * outputs that feed a row-parallel matmul next, Megatron-style). */
+extern "C" int ds4_gpu_tp_col_matmul_tensor(
+        ds4_gpu_tensor *out, const void *model_map,
+        uint64_t weight_offset, const ds4_gpu_tensor *x) {
+    if (!out || !x || !model_map) return 0;
+    int kind = -1; uint64_t out_rows = 0, in_dim = 0, blocks = 0;
+    const char *wptr = cuda_tp_shard_ptr(model_map, weight_offset, &kind, &out_rows, &in_dim, &blocks);
+    if (!wptr || kind != DS4_TP_SHARD_COL) return 0;
+    if (x->bytes < in_dim * sizeof(float) || out->bytes < out_rows * sizeof(float)) return 0;
+    const uint64_t xq_bytes = blocks * 32u;
+    const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
+    void *tmp = cuda_tmp_alloc(scale_offset + blocks * sizeof(float), "tp col prequant");
+    if (!tmp) return 0;
+    int8_t *xq = (int8_t *)tmp; float *xscale = (float *)((char *)tmp + scale_offset);
+    const int use_dp4a = cuda_q8_use_dp4a();
+    quantize_q8_0_f32_kernel<<<(unsigned)blocks, 32, 0, ds4_decode_stream()>>>(
+            xq, xscale, (const float *)x->ptr, in_dim, blocks);
+    if (!cuda_ok(cudaGetLastError(), "tp_col quantize")) return 0;
+    matmul_q8_0_preq_warp8_kernel<<<((unsigned)out_rows + 7u) / 8u, 256, 0, ds4_decode_stream()>>>(
+            (float *)out->ptr, reinterpret_cast<const unsigned char *>(wptr),
+            xq, xscale, in_dim, out_rows, blocks, use_dp4a);
+    return cuda_ok(cudaGetLastError(), "tp_col matmul");
+}
+
+/* Row-parallel: out[out_dim] = rowshard(W) . x_slice (this rank's input slice,
+ * in_dim/k = shard.in_dim elements). add_to!=0 accumulates into out. The caller
+ * all-reduces the per-rank partials to get the full result. */
+extern "C" int ds4_gpu_tp_row_matmul_tensor(
+        ds4_gpu_tensor *out, const void *model_map,
+        uint64_t weight_offset, int add_to, const ds4_gpu_tensor *x) {
+    if (!out || !x || !model_map) return 0;
+    int kind = -1; uint64_t out_dim = 0, in_slice = 0, blocks = 0;
+    const char *wptr = cuda_tp_shard_ptr(model_map, weight_offset, &kind, &out_dim, &in_slice, &blocks);
+    if (!wptr || kind != DS4_TP_SHARD_ROW) return 0;
+    if (x->bytes < in_slice * sizeof(float) || out->bytes < out_dim * sizeof(float)) return 0;
+    const uint64_t xq_bytes = blocks * 32u;
+    const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
+    void *tmp = cuda_tmp_alloc(scale_offset + blocks * sizeof(float), "tp row prequant");
+    if (!tmp) return 0;
+    int8_t *xq = (int8_t *)tmp; float *xscale = (float *)((char *)tmp + scale_offset);
+    const int use_dp4a = cuda_q8_use_dp4a();
+    quantize_q8_0_f32_kernel<<<(unsigned)blocks, 32, 0, ds4_decode_stream()>>>(
+            xq, xscale, (const float *)x->ptr, in_slice, blocks);
+    if (!cuda_ok(cudaGetLastError(), "tp_row quantize")) return 0;
+    /* the packed row-shard is a dense [out_dim x blocks] Q8_0 weight; a full
+     * matmul over its blocks (with optional add_to) gives this rank's partial */
+    matmul_q8_0_preq_warp8_brange_kernel<<<((unsigned)out_dim + 7u) / 8u, 256, 0, ds4_decode_stream()>>>(
+            (float *)out->ptr, reinterpret_cast<const unsigned char *>(wptr),
+            xq, xscale, in_slice, out_dim, blocks, 0, blocks, add_to, use_dp4a);
+    return cuda_ok(cudaGetLastError(), "tp_row matmul");
+}
+
 /* ---- Tensor-Parallel validation/benchmark jig (Q8_0 matmul) ----
  * Reusable, TP-degree-parameterized harness: for a real Q8_0 weight + input,
  * compute the full single-GPU result (golden), then both column-parallel and

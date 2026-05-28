@@ -10352,6 +10352,23 @@ static bool metal_graph_encode_decode_layer(
         DS4_MODEL_VARIANT == DS4_VARIANT_FLASH &&
         !metal_graph_use_reference_hc_decode() &&
         !metal_graph_use_reference_hc_norm_decode();
+    /* Tensor-Parallel attention (head/group split, env DS4_CUDA_TP_ATTN):
+     *  layer_part==4 = part3a (replicated stems + head-range Q/attention + O-proj
+     *    PARTIAL into g->attn_out; the driver all-reduces attn_out across the stage);
+     *  layer_part==5 = part3b (expand the all-reduced attn_out to after_attn_hc, then
+     *    the normal ffn-hc-pre + router). part3a/3b run on the SAME rank's graph, so
+     *    g->hc_split (from 3a's stems) and g->cur_hc persist into 3b. */
+    const int tp_attn = (layer_part == 4);
+    const int tpa_deg = ds4_gpu_tp_degree();
+    const int tpa_rk  = ds4_gpu_tp_rank(ds4_gpu_current_device());
+    const uint32_t tpa_hpr = tp_attn ? (DS4_N_HEAD / (uint32_t)tpa_deg) : DS4_N_HEAD;   /* heads/rank */
+    const uint32_t tpa_h0  = tp_attn ? ((uint32_t)tpa_rk * tpa_hpr) : 0u;               /* owned head base */
+    if (layer_part == 5) {
+        if (ok) ok = ds4_gpu_hc_expand_split_tensor(g->after_attn_hc, g->attn_out,
+                                                    g->cur_hc, g->hc_split,
+                                                    DS4_N_EMBD, DS4_N_HC) != 0;
+        goto tp_attn_post;
+    }
     if (ok && fuse_hc_norm) {
         ok = ds4_gpu_hc_split_weighted_sum_norm_tensor(g->attn_cur,
                                                          g->attn_norm,
@@ -10434,18 +10451,24 @@ static bool metal_graph_encode_decode_layer(
     if (qkv_rms_fused && ok) {
         metal_graph_debug_dump_tensor("KVnorm", g->kv, DS4_N_HEAD_DIM, il, pos);
     }
-    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->q, model->map, model->size,
+    /* q_b: full (replicated) or this rank's owned heads via the COL-shard (TP attn).
+     * tp_col writes the owned hpr heads compacted at g->q[0, hpr*head_dim). */
+    if (ok) {
+        if (tp_attn) ok = ds4_gpu_tp_col_matmul_tensor(g->q, model->map,
+                                                       layer->attn_q_b->abs_offset, g->qr_norm) != 0;
+        else ok = ds4_gpu_matmul_q8_0_tensor(g->q, model->map, model->size,
                                               layer->attn_q_b->abs_offset,
                                               q_rank, q_dim,
                                               g->qr_norm, 1) != 0;
-    if (ok) {
+    }
+    if (ok && !tp_attn) {
         metal_graph_debug_dump_tensor("Qraw", g->q, q_dim, il, pos);
     }
-    if (ok) ok = ds4_gpu_head_rms_norm_tensor(g->q, 1, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_RMS_EPS) != 0;
-    if (ok) {
+    if (ok) ok = ds4_gpu_head_rms_norm_tensor(g->q, 1, tpa_hpr, DS4_N_HEAD_DIM, DS4_RMS_EPS) != 0;
+    if (ok && !tp_attn) {
         metal_graph_debug_dump_tensor("Qnorm", g->q, q_dim, il, pos);
     }
-    if (ok) ok = ds4_gpu_rope_tail_tensor(g->q, 1, DS4_N_HEAD, DS4_N_HEAD_DIM,
+    if (ok) ok = ds4_gpu_rope_tail_tensor(g->q, 1, tpa_hpr, DS4_N_HEAD_DIM,
                                             DS4_N_ROT, pos,
                                             compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
                                             false, freq_base, freq_scale, ext_factor, attn_factor,
@@ -10783,12 +10806,15 @@ static bool metal_graph_encode_decode_layer(
 
     if (ok) {
         const uint32_t raw_start = metal_graph_raw_start_for_span(g, pos, n_raw);
+        /* TP attn: this rank computes only its hpr heads (q/heads compacted at [0,hpr));
+         * sinks is per-head so offset by the owned head base. KV/indexer are shared. */
+        const uint64_t tpa_sinks_off = layer->attn_sinks->abs_offset + (uint64_t)tpa_h0 * sizeof(float);
         if (n_comp != 0 && comp_selected != NULL && n_selected != 0) {
             ok = ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                     g->heads,
                     model->map,
                     model->size,
-                    layer->attn_sinks->abs_offset,
+                    tpa_sinks_off,
                     g->q,
                     raw_cache,
                     g->layer_attn_comp_cache[il],
@@ -10803,7 +10829,7 @@ static bool metal_graph_encode_decode_layer(
                     n_selected,
                     g->raw_window,
                     ds4_layer_compress_ratio(il),
-                    DS4_N_HEAD,
+                    tpa_hpr,
                     DS4_N_HEAD_DIM) != 0;
             if (ok && decode_index_stage_profile) {
                 ok = metal_graph_indexer_stage_profile_boundary("decode_attention",
@@ -10816,7 +10842,7 @@ static bool metal_graph_encode_decode_layer(
         } else {
             ok = ds4_gpu_attention_decode_heads_tensor(g->heads,
                                                          model->map, model->size,
-                                                         layer->attn_sinks->abs_offset,
+                                                         tpa_sinks_off,
                                                          g->q, raw_cache, n_raw,
                                                          raw_cap,
                                                          raw_start,
@@ -10825,7 +10851,7 @@ static bool metal_graph_encode_decode_layer(
                                                          n_comp,
                                                          NULL,
                                                          0,
-                                                         DS4_N_HEAD, DS4_N_HEAD_DIM) != 0;
+                                                         tpa_hpr, DS4_N_HEAD_DIM) != 0;
         }
     }
     DS4_METAL_PROFILE_DECODE_STAGE("attention");
@@ -10833,7 +10859,7 @@ static bool metal_graph_encode_decode_layer(
         metal_graph_debug_dump_tensor("kqv_out", g->heads, q_dim, il, pos);
     }
     if (ok) ok = ds4_gpu_rope_tail_tensor(g->heads,
-                                            1, DS4_N_HEAD, DS4_N_HEAD_DIM,
+                                            1, tpa_hpr, DS4_N_HEAD_DIM,
                                             DS4_N_ROT, pos,
                                             compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
                                             true,
@@ -10843,8 +10869,19 @@ static bool metal_graph_encode_decode_layer(
                                             attn_factor,
                                             DS4_ROPE_YARN_BETA_FAST,
                                             DS4_ROPE_YARN_BETA_SLOW) != 0;
-    if (ok) {
+    if (ok && !tp_attn) {
         metal_graph_debug_dump_tensor("kqv_back", g->heads, q_dim, il, pos);
+    }
+    /* TP attn part3a: grouped O-proj on owned heads -> PARTIAL attn_out (no HC-expand),
+     * then stop. output_a reads this rank's COL-shard (owned groups); output_b is
+     * row-parallel over the owned attn_low rows. The driver all-reduces g->attn_out
+     * across the stage's ranks, then part3b (layer_part==5) expands it to after_attn_hc. */
+    if (tp_attn) {
+        if (ok) ok = ds4_gpu_tp_attention_output_low_q8_tensor(g->attn_low, model->map,
+                        layer->attn_output_a->abs_offset, rank, g->heads) != 0;
+        if (ok) ok = ds4_gpu_tp_row_matmul_tensor(g->attn_out, model->map,
+                        layer->attn_output_b->abs_offset, 0, g->attn_low) != 0;
+        return ok;
     }
     const bool fuse_attn_out_hc =
         !metal_graph_directional_steering_attn_enabled(g) &&
@@ -10903,6 +10940,7 @@ static bool metal_graph_encode_decode_layer(
     if (ok) {
         metal_graph_debug_dump_tensor("hc_attn_post", g->after_attn_hc, hc_dim, il, pos);
     }
+tp_attn_post:   /* TP attn part3b enters here: after_attn_hc ready, do ffn-hc-pre + router */
     if (ok) ok = ds4_gpu_rms_norm_plain_tensor(g->flat_hc, g->after_attn_hc, (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
     if (ok) ok = metal_graph_matmul_plain_tensor(g->hc_mix, model, layer->hc_ffn_fn,
                                                  hc_dim, mix_hc, g->flat_hc, 1);
@@ -10975,7 +11013,7 @@ static bool metal_graph_encode_decode_layer(
         metal_graph_debug_dump_tensor("ffn_moe_weights_scaled", g->router_weights, DS4_N_EXPERT_USED, il, pos);
     }
     } /* !skip_router */
-    if (layer_part == 3) return ok;  /* TP: attention+router done; FFN/MoE runs via metal_graph_tp_ffn_part2 */
+    if (layer_part == 3 || layer_part == 5) return ok;  /* TP: attention+router done; FFN/MoE runs via metal_graph_tp_ffn_part2 */
 decode_layer_post_router:
     if (ok) ok = ds4_gpu_routed_moe_one_tensor(g->routed_out,
                                                  g->routed_gate,
@@ -12075,6 +12113,7 @@ static bool metal_graph_encode_token_raw_swa_tp(
     if (ok) ok = ds4_gpu_synchronize() != 0;
 
     const bool tp_prof = getenv("DS4_TP_PROFILE") != NULL;
+    const bool tp_attn_on = getenv("DS4_CUDA_TP_ATTN") != NULL;
     double tpf_cmp = 0.0, tpf_ar = 0.0, tpf_cmb = 0.0, tpf_t;
     for (int s = 0; ok && s < nstage; s++) {
         const int r0 = s * tp;
@@ -12083,16 +12122,50 @@ static bool metal_graph_encode_token_raw_swa_tp(
             /* (1) attention+router (part3) on EVERY rank. A1: each rank runs the full
              * attention from the identical cur_hc, so they all produce bit-identical
              * ffn_norm/after_attn_hc/hc_split/router — no broadcast. Issue all ranks
-             * before syncing so the attentions overlap across GPUs. */
+             * before syncing so the attentions overlap across GPUs.
+             * DS4_CUDA_TP_ATTN: split attention head/group-wise — part3a (head-range
+             * attention + O-proj PARTIAL) on every rank, all-reduce the partial attn_out
+             * across the stage, then part3b (expand to after_attn_hc + ffn-hc-pre +
+             * router). Halves the attention compute at the cost of +1 all-reduce. */
             tpf_t = tp_prof ? now_sec() : 0.0;
-            for (int r = 0; ok && r < tp; r++) {
-                const int rr = s * tp + r;
-                ds4_gpu_graph *ggr = &pp[rr].g;
-                ds4_gpu_pp_set_device(rr);
-                ok = metal_graph_encode_decode_layer(ggr, model, &weights->layer[il], (uint32_t)il,
-                         pos, ggr->layer_raw_cache[il], ggr->raw_cap, raw_row, n_raw, token, false, 3);
+            if (!tp_attn_on) {
+                for (int r = 0; ok && r < tp; r++) {
+                    const int rr = s * tp + r;
+                    ds4_gpu_graph *ggr = &pp[rr].g;
+                    ds4_gpu_pp_set_device(rr);
+                    ok = metal_graph_encode_decode_layer(ggr, model, &weights->layer[il], (uint32_t)il,
+                             pos, ggr->layer_raw_cache[il], ggr->raw_cap, raw_row, n_raw, token, false, 3);
+                }
+                for (int r = 0; ok && r < tp; r++) { ds4_gpu_pp_set_device(s * tp + r); ok = ok && ds4_gpu_synchronize() != 0; }
+            } else {
+                /* part3a: replicated stems + head-range attention + O-proj partial -> attn_out */
+                for (int r = 0; ok && r < tp; r++) {
+                    const int rr = s * tp + r;
+                    ds4_gpu_graph *ggr = &pp[rr].g;
+                    ds4_gpu_pp_set_device(rr);
+                    ok = metal_graph_encode_decode_layer(ggr, model, &weights->layer[il], (uint32_t)il,
+                             pos, ggr->layer_raw_cache[il], ggr->raw_cap, raw_row, n_raw, token, false, 4);
+                }
+                for (int r = 0; ok && r < tp; r++) { ds4_gpu_pp_set_device(s * tp + r); ok = ok && ds4_gpu_synchronize() != 0; }
+                /* all-reduce the partial attn_out across the stage's ranks */
+                if (ok) {
+                    int adevs[8]; float *abuf[8];
+                    for (int r = 0; r < tp; r++) {
+                        adevs[r] = s * tp + r;
+                        abuf[r] = (float *)ds4_gpu_tensor_device_ptr(pp[s * tp + r].g.attn_out);
+                    }
+                    ok = ds4_gpu_tp_all_reduce_f32(adevs, tp, abuf, (uint32_t)DS4_N_EMBD) != 0;
+                }
+                /* part3b: expand all-reduced attn_out -> after_attn_hc + ffn-hc-pre + router */
+                for (int r = 0; ok && r < tp; r++) {
+                    const int rr = s * tp + r;
+                    ds4_gpu_graph *ggr = &pp[rr].g;
+                    ds4_gpu_pp_set_device(rr);
+                    ok = metal_graph_encode_decode_layer(ggr, model, &weights->layer[il], (uint32_t)il,
+                             pos, ggr->layer_raw_cache[il], ggr->raw_cap, raw_row, n_raw, token, false, 5);
+                }
+                for (int r = 0; ok && r < tp; r++) { ds4_gpu_pp_set_device(s * tp + r); ok = ok && ds4_gpu_synchronize() != 0; }
             }
-            for (int r = 0; ok && r < tp; r++) { ds4_gpu_pp_set_device(s * tp + r); ok = ok && ds4_gpu_synchronize() != 0; }
             /* (1.5) compact the (identical) router selection to each rank's owned
              * experts on the host; needs the router done (synced above). */
             uint32_t moe_count[8] = {0};
@@ -17460,6 +17533,24 @@ static int generate_metal_graph_raw_swa(
                                 uint64_t e0  = (uint64_t)rank * ec;
                                 sharded = ds4_gpu_cache_model_range_force(model->map, model->size,
                                         t->abs_offset + e0 * bpe, ec * bpe, label);
+                            }
+                        } else if (getenv("DS4_CUDA_TP_ATTN") != NULL &&
+                                   t->type == DS4_TENSOR_Q8_0 &&
+                                   (t->dim[0] % (uint64_t)tp) == 0 && (t->dim[1] % (uint64_t)tp) == 0 &&
+                                   (ds4_str_contains(t->name, "attn_q_b") ||
+                                    ds4_str_contains(t->name, "attn_output_a") ||
+                                    ds4_str_contains(t->name, "attn_output_b"))) {
+                            /* Attention-TP (head/group split): q_b + output_a are
+                             * column-parallel (owned heads / owned groups' output rows),
+                             * output_b is row-parallel over the owned attn_low rows. The
+                             * Q8_0 guard excludes the F16 indexer_attn_q_b. */
+                            uint64_t in_dim = t->dim[0], out_dim = t->dim[1];
+                            if (ds4_str_contains(t->name, "attn_output_b")) {
+                                sharded = ds4_gpu_cache_row_shard(model->map, model->size,
+                                        t->abs_offset, in_dim, out_dim, rank, tp, label);
+                            } else {
+                                sharded = ds4_gpu_cache_col_shard(model->map, model->size,
+                                        t->abs_offset, in_dim, out_dim, rank, tp, label);
                             }
                         }
                         if (sharded) total_cached += t->bytes / (uint64_t)tp;

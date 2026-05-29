@@ -12069,6 +12069,7 @@ typedef struct {
     int async_p2p;
     double embed_ms;
     double gpu_ms[DS4_PP_PROFILE_MAX_GPU];
+    double issue_ms[DS4_PP_PROFILE_MAX_GPU];
     double p2p_ms[DS4_PP_PROFILE_MAX_GPU];
     double output_ms;
 } ds4_pp_profile;
@@ -12115,6 +12116,12 @@ static bool metal_graph_encode_token_raw_swa_tp(
     const bool tp_prof = getenv("DS4_TP_PROFILE") != NULL;
     const bool tp_attn_on = getenv("DS4_CUDA_TP_ATTN") != NULL;
     double tpf_cmp = 0.0, tpf_ar = 0.0, tpf_cmb = 0.0, tpf_t;
+    double tpf_sync = 0.0, tpf_sync_t;
+#define TP_BARRIER(stage_, tp_) do { \
+        tpf_sync_t = tp_prof ? now_sec() : 0.0; \
+        for (int r = 0; ok && r < (tp_); r++) { ds4_gpu_pp_set_device((stage_) * (tp_) + r); ok = ok && ds4_gpu_synchronize() != 0; } \
+        if (tp_prof) tpf_sync += now_sec() - tpf_sync_t; \
+    } while (0)
     for (int s = 0; ok && s < nstage; s++) {
         const int r0 = s * tp;
         const int l0 = pp[r0].layer_start, l1 = pp[r0].layer_end;
@@ -12136,7 +12143,7 @@ static bool metal_graph_encode_token_raw_swa_tp(
                     ok = metal_graph_encode_decode_layer(ggr, model, &weights->layer[il], (uint32_t)il,
                              pos, ggr->layer_raw_cache[il], ggr->raw_cap, raw_row, n_raw, token, false, 3);
                 }
-                for (int r = 0; ok && r < tp; r++) { ds4_gpu_pp_set_device(s * tp + r); ok = ok && ds4_gpu_synchronize() != 0; }
+                TP_BARRIER(s, tp);
             } else {
                 /* part3a: replicated stems + head-range attention + O-proj partial -> attn_out */
                 for (int r = 0; ok && r < tp; r++) {
@@ -12146,7 +12153,7 @@ static bool metal_graph_encode_token_raw_swa_tp(
                     ok = metal_graph_encode_decode_layer(ggr, model, &weights->layer[il], (uint32_t)il,
                              pos, ggr->layer_raw_cache[il], ggr->raw_cap, raw_row, n_raw, token, false, 4);
                 }
-                for (int r = 0; ok && r < tp; r++) { ds4_gpu_pp_set_device(s * tp + r); ok = ok && ds4_gpu_synchronize() != 0; }
+                TP_BARRIER(s, tp);
                 /* all-reduce the partial attn_out across the stage's ranks */
                 if (ok) {
                     int adevs[8]; float *abuf[8];
@@ -12164,7 +12171,7 @@ static bool metal_graph_encode_token_raw_swa_tp(
                     ok = metal_graph_encode_decode_layer(ggr, model, &weights->layer[il], (uint32_t)il,
                              pos, ggr->layer_raw_cache[il], ggr->raw_cap, raw_row, n_raw, token, false, 5);
                 }
-                for (int r = 0; ok && r < tp; r++) { ds4_gpu_pp_set_device(s * tp + r); ok = ok && ds4_gpu_synchronize() != 0; }
+                TP_BARRIER(s, tp);
             }
             /* (1.5) compact the (identical) router selection to each rank's owned
              * experts on the host; needs the router done (synced above). */
@@ -12178,7 +12185,7 @@ static bool metal_graph_encode_token_raw_swa_tp(
                 ds4_gpu_pp_set_device(rr);
                 ok = metal_graph_tp_ffn_part2(ggr, model, &weights->layer[il], (uint32_t)il, pos, moe_count[r]);
             }
-            for (int r = 0; ok && r < tp; r++) { ds4_gpu_pp_set_device(s * tp + r); ok = ok && ds4_gpu_synchronize() != 0; }
+            TP_BARRIER(s, tp);
             if (tp_prof) tpf_cmp += now_sec() - tpf_t;
             /* (3) all-reduce routed_out and shared_out across the stage's ranks */
             tpf_t = tp_prof ? now_sec() : 0.0;
@@ -12204,7 +12211,7 @@ static bool metal_graph_encode_token_raw_swa_tp(
                         ggr->shared_out, ggr->after_attn_hc, ggr->hc_split, DS4_N_EMBD, DS4_N_HC) != 0;
                 ds4_gpu_tensor *tmp = ggr->cur_hc; ggr->cur_hc = ggr->after_ffn_hc; ggr->after_ffn_hc = tmp;
             }
-            for (int r = 0; ok && r < tp; r++) { ds4_gpu_pp_set_device(s * tp + r); ok = ok && ds4_gpu_synchronize() != 0; }
+            TP_BARRIER(s, tp);
             if (tp_prof) tpf_cmb += now_sec() - tpf_t;
         }
         /* P2P stage output (rank0 cur_hc) -> ALL ranks of the next stage (A1) */
@@ -12220,9 +12227,10 @@ static bool metal_graph_encode_token_raw_swa_tp(
         }
     }
     if (tp_prof) {
-        fprintf(stderr, "ds4: TP profile (token, ms): compute(attn+ffn+moe)=%.2f all_reduce=%.2f combine=%.2f\n",
-                tpf_cmp * 1000.0, tpf_ar * 1000.0, tpf_cmb * 1000.0);
+        fprintf(stderr, "ds4: TP profile (token, ms): compute(attn+ffn+moe)=%.2f all_reduce=%.2f combine=%.2f [barrier_sync=%.2f of compute+combine]\n",
+                tpf_cmp * 1000.0, tpf_ar * 1000.0, tpf_cmb * 1000.0, tpf_sync * 1000.0);
     }
+#undef TP_BARRIER
 
     /* logits on the output-head device (ngpu-1). Both ranks of the last stage hold
      * the identical final activation in cur_hc (post all-reduce+combine+swap), so
@@ -12320,9 +12328,14 @@ static bool metal_graph_encode_token_raw_swa_pp(
             }
         }
         if (profile) {
+            /* issue_ms = host wall to ISSUE all this chunk's kernels (no sync).
+             * gpu_ms = issue + GPU completion wait. issue_ms≈gpu_ms => host-launch
+             * bound (graphs win); issue_ms<<gpu_ms => GPU-execute bound (need fusion). */
+            const double t_issue_done = now_sec();
             ds4_gpu_pp_set_device(gp);
             if (ok) ok = ds4_gpu_synchronize() != 0;
             if (gp >= 0 && gp < DS4_PP_PROFILE_MAX_GPU) {
+                pp_profile->issue_ms[gp] = (t_issue_done - t_gpu0) * 1000.0;
                 pp_profile->gpu_ms[gp] = (now_sec() - t_gpu0) * 1000.0;
             }
         }
@@ -14376,7 +14389,7 @@ static bool metal_graph_eval_token_raw_swa(
             fprintf(stderr, "ds4: pp token pos=%u embed=%.3f ms",
                     pp_prof.pos, pp_prof.embed_ms);
             for (int gp = 0; gp < pp_prof.ngpu && gp < DS4_PP_PROFILE_MAX_GPU; gp++) {
-                fprintf(stderr, " gpu%d=%.3f ms", gp, pp_prof.gpu_ms[gp]);
+                fprintf(stderr, " gpu%d=%.3f ms(issue=%.3f)", gp, pp_prof.gpu_ms[gp], pp_prof.issue_ms[gp]);
                 if (gp + 1 < pp_prof.ngpu) {
                     fprintf(stderr, " p2p%d_%d=%.3f ms", gp, gp + 1, pp_prof.p2p_ms[gp]);
                 }
@@ -14537,7 +14550,7 @@ static bool metal_graph_eval_token_raw_swa_top(
             fprintf(stderr, "ds4: pp token pos=%u embed=%.3f ms",
                     pp_prof.pos, pp_prof.embed_ms);
             for (int gp = 0; gp < pp_prof.ngpu && gp < DS4_PP_PROFILE_MAX_GPU; gp++) {
-                fprintf(stderr, " gpu%d=%.3f ms", gp, pp_prof.gpu_ms[gp]);
+                fprintf(stderr, " gpu%d=%.3f ms(issue=%.3f)", gp, pp_prof.gpu_ms[gp], pp_prof.issue_ms[gp]);
                 if (gp + 1 < pp_prof.ngpu) {
                     fprintf(stderr, " p2p%d_%d=%.3f ms", gp, gp + 1, pp_prof.p2p_ms[gp]);
                 }
